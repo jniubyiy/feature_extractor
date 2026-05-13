@@ -30,12 +30,20 @@ DECODER_CONFIG = {
 
 # Устройства обучения
 ENCODER_DEVICE_STR = "cuda:0"
-DECODER_DEVICE_STR = "cuda:0"
+DECODER_DEVICE_STR = "cuda:1"
 
 # Обучение
-BATCH_SIZE = 1
-LEARNING_RATE = 0.0001
-NUM_EPOCHS = 100
+BATCH_SIZE = 4
+LEARNING_RATE = 0.00001
+NUM_EPOCHS = 1000
+
+# Веса потерь (для масштабирования до backward)
+LOSS_DECODER_WEIGHT = 1.0   # вес потери декодера
+LOSS_ENCODER_WEIGHT = 1.0   # вес потери энкодера
+
+# Ограничение количества обучающих изображений (берутся с начала датасета)
+# Если None или 0 — используются все доступные.
+MAX_TRAIN_IMAGES = 40
 
 # Директории
 DATASET_DIR = "./prepared_dataset"
@@ -44,7 +52,7 @@ TESTS_DIR = "./tests"
 
 # Чекпоинты
 SAVE_EVERY_EPOCHS = 5
-MAX_CHECKPOINTS = 3
+MAX_CHECKPOINTS = 5
 
 # Валидация
 VALIDATION_SPLIT = 0.1      # доля данных для валидации (берутся из конца датасета)

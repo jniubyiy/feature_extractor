@@ -23,27 +23,33 @@ DECODER_DEVICE = torch.device(DECODER_DEVICE_STR if torch.cuda.is_available() el
 print(f"Encoder device: {ENCODER_DEVICE}, Decoder device: {DECODER_DEVICE}")
 
 
-# ==================== Датасет ====================
+# ==================== Датасет (ленивая загрузка) ====================
 class ImageDataset(Dataset):
+    """
+    Датасет, который хранит только список путей к .pt файлам в RAM.
+    Каждый __getitem__ загружает один файл, преобразует в тензоры и возвращает.
+    После выхода из батча загруженные тензоры автоматически удаляются из RAM.
+    """
     def __init__(self, file_list):
-        self.files = file_list
+        self.files = file_list  # список путей к файлам
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
+        # Загрузка одного файла с диска
         data = torch.load(self.files[idx], map_location='cpu', weights_only=False)
         image = data['image']  # (3, H, W)
         mask = data['mask']    # (H, W)
         if mask.dim() == 2:
-            mask = mask.unsqueeze(0)
+            mask = mask.unsqueeze(0)  # -> (1, H, W)
         return image, mask
 
 
 def collate_fn(batch):
     images, masks = zip(*batch)
-    images = torch.stack(images, dim=0)
-    masks = torch.stack(masks, dim=0)
+    images = torch.stack(images, dim=0)  # (B, 3, H, W)
+    masks = torch.stack(masks, dim=0)    # (B, 1, H, W)
     return images, masks
 
 
@@ -129,9 +135,8 @@ def apply_saved_gradients(model, saved_grads, optimizer):
     optimizer.zero_grad()
 
 
-# ==================== Функции валидации (как в примере) ====================
+# ==================== Валидация и тестирование ====================
 def evaluate_reconstruction(encoder, decoder, loader):
-    """Считает средние MSE и PSNR по всему loader без градиентов."""
     encoder.eval()
     decoder.eval()
     total_mse = 0.0
@@ -161,63 +166,40 @@ def evaluate_reconstruction(encoder, decoder, loader):
 
 
 def validate(encoder, decoder, val_loader):
-    """Возвращает словарь с метриками валидации в стиле примера."""
     mse, psnr = evaluate_reconstruction(encoder, decoder, val_loader)
     return {'mse': mse, 'psnr': psnr}
 
 
-# ==================== Сохранение тестовых примеров ====================
 def tensor_to_pil(img_tensor):
-    """Преобразует тензор (C, H, W) со значениями [0,1] в PIL Image RGB."""
     arr = (img_tensor.cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
     arr = np.transpose(arr, (1, 2, 0))
     return Image.fromarray(arr)
 
 
 def save_test_example(epoch, example_idx, original_image, mask, reconstructed, metrics):
-    """
-    Сохраняет в ./tests/epoch_N/example_M/ изображения и метрики.
-    original_image, mask, reconstructed: тензоры (3,H,W) или (1,H,W) в [0,1].
-    metrics: dict с ключами 'mse', 'psnr'.
-    """
     base_dir = os.path.join(TESTS_DIR, f"epoch_{epoch}", f"example_{example_idx}")
     os.makedirs(base_dir, exist_ok=True)
 
-    # Сохраняем оригинал
-    orig_pil = tensor_to_pil(original_image)
-    orig_pil.save(os.path.join(base_dir, "original.png"))
-
-    # Маска в grayscale (сохраняем как изображение, для наглядности)
+    tensor_to_pil(original_image).save(os.path.join(base_dir, "original.png"))
     mask_np = mask.cpu().squeeze().numpy()
-    mask_img = Image.fromarray((mask_np * 255).astype(np.uint8), mode='L')
-    mask_img.save(os.path.join(base_dir, "mask.png"))
+    Image.fromarray((mask_np * 255).astype(np.uint8), mode='L').save(os.path.join(base_dir, "mask.png"))
+    tensor_to_pil(reconstructed).save(os.path.join(base_dir, "reconstructed.png"))
+    tensor_to_pil((reconstructed - original_image).abs()).save(os.path.join(base_dir, "difference.png"))
 
-    # Реконструированное изображение
-    recon_pil = tensor_to_pil(reconstructed)
-    recon_pil.save(os.path.join(base_dir, "reconstructed.png"))
-
-    # Разница (усиленная для видимости)
-    diff = (reconstructed - original_image).abs()
-    diff_pil = tensor_to_pil(diff)
-    diff_pil.save(os.path.join(base_dir, "difference.png"))
-
-    # Метрики в текстовый файл
     with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
         f.write(f"MSE: {metrics['mse']:.6f}\n")
         f.write(f"PSNR: {metrics['psnr']:.2f} dB\n")
 
 
 def run_tests(encoder, decoder, dataset, epoch):
-    """Выбирает NUM_TEST_EXAMPLES случайных индексов из dataset, прогоняет и сохраняет."""
     encoder.eval()
     decoder.eval()
     indices = random.sample(range(len(dataset)), min(NUM_TEST_EXAMPLES, len(dataset)))
 
     for idx in indices:
-        image, mask = dataset[idx]  # (3,H,W), (1,H,W) на CPU
+        image, mask = dataset[idx]
         example_id = int(os.path.splitext(os.path.basename(dataset.files[idx]))[0])
 
-        # Перенос на устройства
         img_enc = image.unsqueeze(0).to(ENCODER_DEVICE)
         msk_enc = mask.unsqueeze(0).to(ENCODER_DEVICE)
         img_dec = image.unsqueeze(0).to(DECODER_DEVICE)
@@ -226,12 +208,11 @@ def run_tests(encoder, decoder, dataset, epoch):
         with torch.no_grad():
             pooled = encoder(img_enc, msk_enc)
             pooled_dec = pooled.to(DECODER_DEVICE)
-            recon = decoder(pooled_dec, msk_dec)  # (1,3,H,W)
+            recon = decoder(pooled_dec, msk_dec)
 
         mse_val = masked_mse_loss(recon, img_dec, msk_dec).item()
         psnr_val = compute_psnr(recon, img_dec, msk_dec)
 
-        # Сохраняем с оригинальными тензорами на CPU (убираем batch)
         save_test_example(epoch, example_id, image, mask.squeeze(0), recon.squeeze(0).cpu(),
                           {'mse': mse_val, 'psnr': psnr_val})
 
@@ -250,59 +231,56 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, epoch):
     num_batches = len(train_loader)
 
     for batch_idx, (images, masks) in enumerate(train_loader):
+        # images, masks загружены лениво через DataLoader, теперь они в RAM
         images_enc = images.to(ENCODER_DEVICE, non_blocking=True)
         masks_enc = masks.to(ENCODER_DEVICE, non_blocking=True)
         images_dec = images.to(DECODER_DEVICE, non_blocking=True)
         masks_dec = masks.to(DECODER_DEVICE, non_blocking=True)
 
-        # ------------------------------------------------------------------
-        # Фаза 1: обучение декодера (энкодер заморожен)
-        # ------------------------------------------------------------------
-        for p in encoder.parameters():
-            p.requires_grad = False
-        for p in decoder.parameters():
-            p.requires_grad = True
+        # После копирования на GPU, переменные images, masks на CPU могут быть удалены
+        # (это произойдёт при следующей итерации цикла)
 
+        # Фаза 1: декодер
+        for p in encoder.parameters(): p.requires_grad = False
+        for p in decoder.parameters(): p.requires_grad = True
         opt_dec.zero_grad()
+
         with torch.no_grad():
             pooled_enc = encoder(images_enc, masks_enc)
             pooled_dec = pooled_enc.to(DECODER_DEVICE)
         reconstructed_1 = decoder(pooled_dec, masks_dec)
-        loss_dec = masked_mse_loss(reconstructed_1, images_dec, masks_dec)
-
+        loss_dec_raw = masked_mse_loss(reconstructed_1, images_dec, masks_dec)
+        loss_dec = LOSS_DECODER_WEIGHT * loss_dec_raw
         loss_dec.backward()
         saved_grads_dec = {name: param.grad.clone().cpu() if param.grad is not None else None
                            for name, param in decoder.named_parameters()}
         opt_dec.zero_grad()
 
-        # ------------------------------------------------------------------
-        # Фаза 2: обучение энкодера (декодер заморожен)
-        # ------------------------------------------------------------------
-        for p in encoder.parameters():
-            p.requires_grad = True
-        for p in decoder.parameters():
-            p.requires_grad = False
-
+        # Фаза 2: энкодер
+        for p in encoder.parameters(): p.requires_grad = True
+        for p in decoder.parameters(): p.requires_grad = False
         opt_enc.zero_grad()
+
         pooled_enc = encoder(images_enc, masks_enc)
         pooled_dec = pooled_enc.to(DECODER_DEVICE)
         reconstructed_2 = decoder(pooled_dec, masks_dec)
-        loss_enc = masked_mse_loss(reconstructed_2, images_dec, masks_dec)
-
+        loss_enc_raw = masked_mse_loss(reconstructed_2, images_dec, masks_dec)
+        loss_enc = LOSS_ENCODER_WEIGHT * loss_enc_raw
         loss_enc.backward()
 
-        # Применяем градиенты
         apply_saved_gradients(decoder, saved_grads_dec, opt_dec)
         opt_enc.step()
         opt_enc.zero_grad()
 
-        total_loss_dec += loss_dec.item()
-        total_loss_enc += loss_enc.item()
+        total_loss_dec += loss_dec_raw.item()
+        total_loss_enc += loss_enc_raw.item()
 
         print(f"Batch {batch_idx+1}/{num_batches}")
-        print(f"LossDec: {loss_dec.item():.6f}")
-        print(f"LossEnc: {loss_enc.item():.6f}")
+        print(f"LossDec: {loss_dec_raw.item():.6f}")
+        print(f"LossEnc: {loss_enc_raw.item():.6f}")
 
+        # Явное удаление тензоров CPU/GPU, освобождение памяти
+        del images_enc, masks_enc, images_dec, masks_dec, pooled_enc, pooled_dec, reconstructed_1, reconstructed_2
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -317,6 +295,7 @@ def train():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
 
+    # 1. Список имён файлов из prepared_dataset (хранится в RAM)
     all_files = sorted(
         [os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith('.pt')],
         key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
@@ -325,6 +304,7 @@ def train():
         raise RuntimeError(f"No .pt files in {DATASET_DIR}")
     print(f"Found {len(all_files)} samples.")
 
+    # 2. Разделение на train/val (валидация – последние VALIDATION_SPLIT*100%)
     if VALIDATION_SPLIT > 0:
         num_val = max(1, int(len(all_files) * VALIDATION_SPLIT))
         train_files = all_files[:-num_val] if num_val < len(all_files) else []
@@ -332,17 +312,27 @@ def train():
     else:
         train_files = all_files
         val_files = []
-    print(f"Train: {len(train_files)}, Val: {len(val_files)} (last {len(val_files)} files)")
 
-    train_dataset = ImageDataset(train_files)
+    # 3. Ограничение количества тренировочных изображений (первые MAX_TRAIN_IMAGES)
+    if MAX_TRAIN_IMAGES and MAX_TRAIN_IMAGES > 0:
+        train_files = train_files[:MAX_TRAIN_IMAGES]
+        print(f"Training limited to first {len(train_files)} images (MAX_TRAIN_IMAGES = {MAX_TRAIN_IMAGES}).")
+    else:
+        print(f"Using all {len(train_files)} training images.")
+
+    print(f"Train files in RAM: {len(train_files)}, Val files: {len(val_files)} (last {len(val_files)} files)")
+
+    # 4. Создание Dataset и DataLoader (ленивая загрузка)
+    train_dataset = ImageDataset(train_files)  # в памяти только список путей
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                              collate_fn=collate_fn, pin_memory=True)
+                              collate_fn=collate_fn, pin_memory=True, num_workers=0)
     val_loader = None
     if val_files:
         val_dataset = ImageDataset(val_files)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                                collate_fn=collate_fn, pin_memory=True)
+                                collate_fn=collate_fn, pin_memory=True, num_workers=0)
 
+    # 5. Модели и оптимизаторы
     encoder = Encoder(**ENCODER_CONFIG).to(ENCODER_DEVICE)
     decoder = Decoder(**DECODER_CONFIG).to(DECODER_DEVICE)
 
@@ -351,6 +341,7 @@ def train():
 
     start_epoch = load_checkpoints_if_exist(encoder, decoder) + 1
 
+    # 6. Цикл обучения
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
         losses = train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, epoch)
