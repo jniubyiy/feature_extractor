@@ -39,16 +39,21 @@ NUM_EPOCHS = 100
 
 # Директории
 DATASET_DIR = "./prepared_dataset"
-MODELS_DIR = "./checkpoints"
+MODELS_DIR = "./models"
+TESTS_DIR = "./tests"
 
 # Чекпоинты
 SAVE_EVERY_EPOCHS = 5
 MAX_CHECKPOINTS = 3
 
 # Валидация
-VALIDATION_SPLIT = 0.1
+VALIDATION_SPLIT = 0.1      # доля данных для валидации (берутся из конца датасета)
+VAL_EVERY_EPOCHS = 5        # каждые сколько эпох делать валидацию
+
+# Тестирование (сохраняется в ./tests/epoch_N/)
+TEST_EVERY_EPOCHS = 5       # как часто запускать тестовые примеры
+NUM_TEST_EXAMPLES = 3       # сколько случайных примеров из train_dataset сохранять
 
 # Другие
 RANDOM_SEED = 42
-USE_AMP = True          # использовать автоматическое смешанное точность (AMP)
 CLEAR_CACHE_EACH_BATCH = True
