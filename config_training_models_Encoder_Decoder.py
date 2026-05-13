@@ -30,10 +30,10 @@ DECODER_CONFIG = {
 
 # Устройства обучения
 ENCODER_DEVICE_STR = "cuda:0"
-DECODER_DEVICE_STR = "cuda:1"
+DECODER_DEVICE_STR = "cuda:0"
 
 # Обучение
-BATCH_SIZE = 8
+BATCH_SIZE = 12
 LEARNING_RATE = 0.00001
 NUM_EPOCHS = 1000
 
@@ -43,12 +43,13 @@ LOSS_ENCODER_WEIGHT = 1.0   # вес потери энкодера
 
 # Ограничение количества обучающих изображений (берутся с начала датасета)
 # Если None или 0 — используются все доступные.
-MAX_TRAIN_IMAGES = 40
+MAX_TRAIN_IMAGES = 200
 
 # Директории
 DATASET_DIR = "./prepared_dataset"
 MODELS_DIR = "./models"
 TESTS_DIR = "./tests"
+VAL_TESTS_DIR = "./val_tests"      # папка для валидационных примеров
 
 # Чекпоинты
 SAVE_EVERY_EPOCHS = 10
@@ -59,8 +60,8 @@ VALIDATION_SPLIT = 10         # количество последних изоб
 VAL_EVERY_EPOCHS = 10           # каждые сколько эпох делать валидацию
 
 # Тестирование (сохраняется в ./tests/epoch_N/)
-TEST_EVERY_EPOCHS = 5       # как часто запускать тестовые примеры
-NUM_TEST_EXAMPLES = 3       # сколько случайных примеров из train_dataset сохранять
+TEST_EVERY_EPOCHS = 20       # как часто запускать тестовые примеры
+NUM_TEST_EXAMPLES = 10       # сколько случайных примеров из train_dataset сохранять
 
 # Другие
 RANDOM_SEED = 42
