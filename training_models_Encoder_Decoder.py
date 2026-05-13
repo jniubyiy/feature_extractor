@@ -299,10 +299,9 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, epoch):
         total_loss_dec += loss_dec.item()
         total_loss_enc += loss_enc.item()
 
-        if batch_idx % 10 == 0 or batch_idx == num_batches - 1:
-            print(f"Batch {batch_idx+1}/{num_batches}")
-            print(f"LossDec: {loss_dec.item():.6f}")
-            print(f"LossEnc: {loss_enc.item():.6f}")
+        print(f"Batch {batch_idx+1}/{num_batches}")
+        print(f"LossDec: {loss_dec.item():.6f}")
+        print(f"LossEnc: {loss_enc.item():.6f}")
 
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
