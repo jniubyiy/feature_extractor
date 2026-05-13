@@ -176,15 +176,15 @@ def tensor_to_pil(img_tensor):
     return Image.fromarray(arr)
 
 
-def save_test_example(epoch, example_idx, original_image, mask, reconstructed, metrics):
-    base_dir = os.path.join(TESTS_DIR, f"epoch_{epoch}", f"example_{example_idx}")
+def save_example(base_dir, example_idx, original_image, mask, reconstructed, metrics):
+    """Сохраняет один пример (изображения + метрики) в указанную папку."""
     os.makedirs(base_dir, exist_ok=True)
 
-    tensor_to_pil(original_image).save(os.path.join(base_dir, "original.png"))
+    tensor_to_pil(original_image).save(os.path.join(base_dir, f"original.png"))
     mask_np = mask.cpu().squeeze().numpy()
-    Image.fromarray((mask_np * 255).astype(np.uint8), mode='L').save(os.path.join(base_dir, "mask.png"))
-    tensor_to_pil(reconstructed).save(os.path.join(base_dir, "reconstructed.png"))
-    tensor_to_pil((reconstructed - original_image).abs()).save(os.path.join(base_dir, "difference.png"))
+    Image.fromarray((mask_np * 255).astype(np.uint8), mode='L').save(os.path.join(base_dir, f"mask.png"))
+    tensor_to_pil(reconstructed).save(os.path.join(base_dir, f"reconstructed.png"))
+    tensor_to_pil((reconstructed - original_image).abs()).save(os.path.join(base_dir, f"difference.png"))
 
     with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
         f.write(f"MSE: {metrics['mse']:.6f}\n")
@@ -192,6 +192,7 @@ def save_test_example(epoch, example_idx, original_image, mask, reconstructed, m
 
 
 def run_tests(encoder, decoder, dataset, epoch):
+    """Тестовые примеры из обучающего набора (случайные NUM_TEST_EXAMPLES)."""
     encoder.eval()
     decoder.eval()
     indices = random.sample(range(len(dataset)), min(NUM_TEST_EXAMPLES, len(dataset)))
@@ -213,8 +214,44 @@ def run_tests(encoder, decoder, dataset, epoch):
         mse_val = masked_mse_loss(recon, img_dec, msk_dec).item()
         psnr_val = compute_psnr(recon, img_dec, msk_dec)
 
-        save_test_example(epoch, example_id, image, mask.squeeze(0), recon.squeeze(0).cpu(),
-                          {'mse': mse_val, 'psnr': psnr_val})
+        base_dir = os.path.join(TESTS_DIR, f"epoch_{epoch}", f"example_{example_id}")
+        save_example(base_dir, example_id, image, mask.squeeze(0), recon.squeeze(0).cpu(),
+                     {'mse': mse_val, 'psnr': psnr_val})
+
+    encoder.train()
+    decoder.train()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def save_all_val_examples(encoder, decoder, val_dataset, epoch):
+    """
+    Сохраняет все валидационные примеры в ./val_tests/epoch_N/example_ID/.
+    Проходим по всему val_dataset.
+    """
+    encoder.eval()
+    decoder.eval()
+
+    for idx in range(len(val_dataset)):
+        image, mask = val_dataset[idx]
+        example_id = int(os.path.splitext(os.path.basename(val_dataset.files[idx]))[0])
+
+        img_enc = image.unsqueeze(0).to(ENCODER_DEVICE)
+        msk_enc = mask.unsqueeze(0).to(ENCODER_DEVICE)
+        img_dec = image.unsqueeze(0).to(DECODER_DEVICE)
+        msk_dec = mask.unsqueeze(0).to(DECODER_DEVICE)
+
+        with torch.no_grad():
+            pooled = encoder(img_enc, msk_enc)
+            pooled_dec = pooled.to(DECODER_DEVICE)
+            recon = decoder(pooled_dec, msk_dec)
+
+        mse_val = masked_mse_loss(recon, img_dec, msk_dec).item()
+        psnr_val = compute_psnr(recon, img_dec, msk_dec)
+
+        base_dir = os.path.join(VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{example_id}")
+        save_example(base_dir, example_id, image, mask.squeeze(0), recon.squeeze(0).cpu(),
+                     {'mse': mse_val, 'psnr': psnr_val})
 
     encoder.train()
     decoder.train()
@@ -231,14 +268,10 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, epoch):
     num_batches = len(train_loader)
 
     for batch_idx, (images, masks) in enumerate(train_loader):
-        # images, masks загружены лениво через DataLoader, теперь они в RAM
         images_enc = images.to(ENCODER_DEVICE, non_blocking=True)
         masks_enc = masks.to(ENCODER_DEVICE, non_blocking=True)
         images_dec = images.to(DECODER_DEVICE, non_blocking=True)
         masks_dec = masks.to(DECODER_DEVICE, non_blocking=True)
-
-        # После копирования на GPU, переменные images, masks на CPU могут быть удалены
-        # (это произойдёт при следующей итерации цикла)
 
         # Фаза 1: декодер
         for p in encoder.parameters(): p.requires_grad = False
@@ -279,7 +312,6 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, epoch):
         print(f"LossDec: {loss_dec_raw.item():.6f}")
         print(f"LossEnc: {loss_enc_raw.item():.6f}")
 
-        # Явное удаление тензоров CPU/GPU, освобождение памяти
         del images_enc, masks_enc, images_dec, masks_dec, pooled_enc, pooled_dec, reconstructed_1, reconstructed_2
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -295,7 +327,6 @@ def train():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
 
-    # 1. Список имён файлов из prepared_dataset (хранится в RAM)
     all_files = sorted(
         [os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith('.pt')],
         key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
@@ -304,35 +335,35 @@ def train():
         raise RuntimeError(f"No .pt files in {DATASET_DIR}")
     print(f"Found {len(all_files)} samples.")
 
-    # 2. Разделение на train/val (валидация – последние VALIDATION_SPLIT*100%)
-    if VALIDATION_SPLIT > 0:
-        num_val = max(1, int(len(all_files) * VALIDATION_SPLIT))
-        train_files = all_files[:-num_val] if num_val < len(all_files) else []
-        val_files = all_files[-num_val:]
-    else:
-        train_files = all_files
-        val_files = []
-
-    # 3. Ограничение количества тренировочных изображений (первые MAX_TRAIN_IMAGES)
     if MAX_TRAIN_IMAGES and MAX_TRAIN_IMAGES > 0:
-        train_files = train_files[:MAX_TRAIN_IMAGES]
+        train_files = all_files[:MAX_TRAIN_IMAGES]
         print(f"Training limited to first {len(train_files)} images (MAX_TRAIN_IMAGES = {MAX_TRAIN_IMAGES}).")
     else:
-        print(f"Using all {len(train_files)} training images.")
+        train_files = all_files[:]
+        print(f"Using all {len(train_files)} available images for training.")
 
-    print(f"Train files in RAM: {len(train_files)}, Val files: {len(val_files)} (last {len(val_files)} files)")
+    if VALIDATION_SPLIT > 0:
+        start_val_idx = len(train_files)
+        end_val_idx = start_val_idx + VALIDATION_SPLIT
+        val_files = all_files[start_val_idx:end_val_idx] if start_val_idx < len(all_files) else []
+        if len(val_files) < VALIDATION_SPLIT:
+            print(f"Warning: only {len(val_files)} validation files available (requested {VALIDATION_SPLIT}).")
+    else:
+        val_files = []
 
-    # 4. Создание Dataset и DataLoader (ленивая загрузка)
-    train_dataset = ImageDataset(train_files)  # в памяти только список путей
+    print(f"Train files in RAM: {len(train_files)}")
+    print(f"Val files: {len(val_files)} (immediately after training)")
+
+    train_dataset = ImageDataset(train_files)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_fn, pin_memory=True, num_workers=0)
     val_loader = None
+    val_dataset = None
     if val_files:
         val_dataset = ImageDataset(val_files)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
                                 collate_fn=collate_fn, pin_memory=True, num_workers=0)
 
-    # 5. Модели и оптимизаторы
     encoder = Encoder(**ENCODER_CONFIG).to(ENCODER_DEVICE)
     decoder = Decoder(**DECODER_CONFIG).to(DECODER_DEVICE)
 
@@ -341,7 +372,6 @@ def train():
 
     start_epoch = load_checkpoints_if_exist(encoder, decoder) + 1
 
-    # 6. Цикл обучения
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
         losses = train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, epoch)
@@ -354,6 +384,10 @@ def train():
             print(f"Epoch {epoch:3d} VAL")
             print(f"MSE: {val_metrics['mse']:.6f}")
             print(f"PSNR: {val_metrics['psnr']:.2f} dB")
+
+            # Сохраняем все валидационные примеры
+            print(f"Saving all validation examples to {VAL_TESTS_DIR}/epoch_{epoch}...")
+            save_all_val_examples(encoder, decoder, val_dataset, epoch)
 
         if epoch % TEST_EVERY_EPOCHS == 0:
             print(f"Running test examples for epoch {epoch}...")

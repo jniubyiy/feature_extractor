@@ -33,7 +33,7 @@ ENCODER_DEVICE_STR = "cuda:0"
 DECODER_DEVICE_STR = "cuda:1"
 
 # Обучение
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 LEARNING_RATE = 0.00001
 NUM_EPOCHS = 1000
 
@@ -51,12 +51,12 @@ MODELS_DIR = "./models"
 TESTS_DIR = "./tests"
 
 # Чекпоинты
-SAVE_EVERY_EPOCHS = 5
-MAX_CHECKPOINTS = 5
+SAVE_EVERY_EPOCHS = 10
+MAX_CHECKPOINTS = 3
 
 # Валидация
-VALIDATION_SPLIT = 0.1      # доля данных для валидации (берутся из конца датасета)
-VAL_EVERY_EPOCHS = 5        # каждые сколько эпох делать валидацию
+VALIDATION_SPLIT = 10         # количество последних изображений для валидации (целое число)
+VAL_EVERY_EPOCHS = 10           # каждые сколько эпох делать валидацию
 
 # Тестирование (сохраняется в ./tests/epoch_N/)
 TEST_EVERY_EPOCHS = 5       # как часто запускать тестовые примеры
