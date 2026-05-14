@@ -177,7 +177,6 @@ def tensor_to_pil(img_tensor):
 
 
 def save_example(base_dir, example_idx, original_image, mask, reconstructed, metrics):
-    """Сохраняет один пример (изображения + метрики) в указанную папку."""
     os.makedirs(base_dir, exist_ok=True)
 
     tensor_to_pil(original_image).save(os.path.join(base_dir, f"original.png"))
@@ -192,7 +191,6 @@ def save_example(base_dir, example_idx, original_image, mask, reconstructed, met
 
 
 def run_tests(encoder, decoder, dataset, epoch):
-    """Тестовые примеры из обучающего набора (случайные NUM_TEST_EXAMPLES)."""
     encoder.eval()
     decoder.eval()
     indices = random.sample(range(len(dataset)), min(NUM_TEST_EXAMPLES, len(dataset)))
@@ -225,10 +223,6 @@ def run_tests(encoder, decoder, dataset, epoch):
 
 
 def save_all_val_examples(encoder, decoder, val_dataset, epoch):
-    """
-    Сохраняет все валидационные примеры в ./val_tests/epoch_N/example_ID/.
-    Проходим по всему val_dataset.
-    """
     encoder.eval()
     decoder.eval()
 
@@ -335,24 +329,28 @@ def train():
         raise RuntimeError(f"No .pt files in {DATASET_DIR}")
     print(f"Found {len(all_files)} samples.")
 
+    # Разделение train/val с гарантией наличия валидации
     if MAX_TRAIN_IMAGES and MAX_TRAIN_IMAGES > 0:
+        # Обучение – первые MAX_TRAIN_IMAGES
         train_files = all_files[:MAX_TRAIN_IMAGES]
-        print(f"Training limited to first {len(train_files)} images (MAX_TRAIN_IMAGES = {MAX_TRAIN_IMAGES}).")
-    else:
-        train_files = all_files[:]
-        print(f"Using all {len(train_files)} available images for training.")
-
-    if VALIDATION_SPLIT > 0:
-        start_val_idx = len(train_files)
-        end_val_idx = start_val_idx + VALIDATION_SPLIT
-        val_files = all_files[start_val_idx:end_val_idx] if start_val_idx < len(all_files) else []
+        # Валидация – следующие VALIDATION_SPLIT файлов (сразу после обучения)
+        start_val = len(train_files)
+        end_val = start_val + VALIDATION_SPLIT
+        val_files = all_files[start_val:end_val] if start_val < len(all_files) else []
         if len(val_files) < VALIDATION_SPLIT:
             print(f"Warning: only {len(val_files)} validation files available (requested {VALIDATION_SPLIT}).")
     else:
-        val_files = []
+        # Обучение – все, кроме последних VALIDATION_SPLIT (если >0)
+        if VALIDATION_SPLIT > 0:
+            n_val = min(VALIDATION_SPLIT, len(all_files))
+            train_files = all_files[:-n_val] if n_val < len(all_files) else []
+            val_files = all_files[-n_val:] if n_val > 0 else []
+        else:
+            train_files = all_files[:]
+            val_files = []
 
-    print(f"Train files in RAM: {len(train_files)}")
-    print(f"Val files: {len(val_files)} (immediately after training)")
+    print(f"Train files: {len(train_files)}")
+    print(f"Val files: {len(val_files)}")
 
     train_dataset = ImageDataset(train_files)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
@@ -385,7 +383,6 @@ def train():
             print(f"MSE: {val_metrics['mse']:.6f}")
             print(f"PSNR: {val_metrics['psnr']:.2f} dB")
 
-            # Сохраняем все валидационные примеры
             print(f"Saving all validation examples to {VAL_TESTS_DIR}/epoch_{epoch}...")
             save_all_val_examples(encoder, decoder, val_dataset, epoch)
 
