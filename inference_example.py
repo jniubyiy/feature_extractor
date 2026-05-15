@@ -86,7 +86,7 @@ def load_inference_model(path: str) -> torch.jit.ScriptModule:
 # ──────────────────────────────────────────────────────────────────────
 def image_to_tensor(pil_image: Image.Image, size: int = 512) -> torch.Tensor:
     """Преобразует PIL RGB изображение в тензор [1,3,size,size] в диапазоне [-1,1]."""
-    img = pil_image.resize((size, size), Image.LANCZOS)
+    img = pil_image.resize((size, size), Image.Resampling.LANCZOS)
     arr = np.array(img).astype(np.float32) / 255.0
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0) * 2 - 1
     return t.to(DEVICE)
