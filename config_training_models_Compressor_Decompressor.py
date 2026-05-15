@@ -34,7 +34,7 @@ TESTS_DIR = "./tests_compressor"
 VAL_TESTS_DIR = "./val_tests_compressor"
 
 # Путь к чекпоинту декодера для визуализации
-DECODER_CHECKPOINT = "./models/decoder_epoch178.pth"
+DECODER_CHECKPOINT = "./models/decoder_epoch200.pth"
 
 SAVE_EVERY_EPOCHS = 1
 MAX_CHECKPOINTS = 5

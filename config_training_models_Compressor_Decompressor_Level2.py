@@ -39,7 +39,7 @@ TESTS_DIR = "./tests_compressor_level2"
 VAL_TESTS_DIR = "./val_tests_compressor_level2"
 
 # Декодер основного автоэнкодера
-DECODER_CHECKPOINT = "./models/decoder_epoch178.pth"
+DECODER_CHECKPOINT = "./models/decoder_epoch200.pth"
 # Декомпрессор первого уровня (из models_compressor)
 LEVEL1_DECOMPRESSOR_CHECKPOINT = "./models_compressor/decompressor_epoch100.pth"
 
