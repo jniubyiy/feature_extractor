@@ -45,14 +45,22 @@ def export_single_model(ckpt_path: Path, output_dir: Path):
     print(f"Экспорт {model_name} из {ckpt_path} ...")
     ModelClass, config = MODEL_REGISTRY[model_name]
     model = ModelClass(**config).to(DEVICE)
-    state_dict = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+
+    # Загружаем чекпоинт, учитывая возможный формат (полный или только state_dict)
+    checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        # Полный чекпоинт (с оптимизатором и эпохой)
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        # Только state_dict
+        state_dict = checkpoint
+
     model.load_state_dict(state_dict)
     model.eval()
 
     input_shape = (1,) + INPUT_SHAPES[model_name]
     example_input = torch.randn(*input_shape, device=DEVICE)
 
-    # Пробуем трассировку
     try:
         traced_model = torch.jit.trace(model, example_input)
     except Exception as e:
@@ -63,7 +71,6 @@ def export_single_model(ckpt_path: Path, output_dir: Path):
             print(f"Не удалось экспортировать {model_name}: {e2}")
             return
 
-    # Сохранение с помощью torch.jit.save (корректный способ)
     output_path = output_dir / f"{model_name}_inference.pt"
     torch.jit.save(traced_model, str(output_path))
     print(f"Сохранён {output_path}")

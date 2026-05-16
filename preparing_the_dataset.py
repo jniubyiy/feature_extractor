@@ -1,13 +1,11 @@
 # preparing_the_dataset.py
 
 import os
-import argparse
 import numpy as np
 from PIL import Image
 import torch
 from pathlib import Path
 import concurrent.futures
-import multiprocessing
 
 import config_preparing_the_dataset as cfg
 
@@ -33,7 +31,7 @@ def process_single_image(args_tuple):
             ratio = target_resolution / max_side
             new_w = int(round(w * ratio))
             new_h = int(round(h * ratio))
-            img = img.resize((new_w, new_h), Image.LANCZOS)
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
             w, h = new_w, new_h
 
         # Центрирование с чёрным паддингом
@@ -60,7 +58,7 @@ def process_single_image(args_tuple):
         return (file_path.name, f"ERROR: {e}")
 
 
-def prepare_dataset(target_resolution: int, dataset_dir: str = "./dataset", output_dir: str = "./prepared_dataset"):
+def prepare_dataset(target_resolution: int, dataset_dir: str, output_dir: str):
     """
     Параллельно (через multiprocessing) загружает, обрабатывает и сохраняет
     все подходящие изображения из dataset_dir.
@@ -110,18 +108,8 @@ def prepare_dataset(target_resolution: int, dataset_dir: str = "./dataset", outp
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Подготовка датасета: параллельная обработка изображений с паддингом и масками."
-    )
-    parser.add_argument(
-        "--resolution", type=int, default=cfg.TARGET_RESOLUTION,
-        help="Целевое разрешение (сторона квадрата), должно быть кратно 32."
-    )
-    parser.add_argument("--dataset_dir", type=str, default="./dataset")
-    parser.add_argument("--output_dir", type=str, default="./prepared_dataset")
-    args = parser.parse_args()
-
-    if args.resolution % 32 != 0:
+    # Проверка кратности разрешения 32
+    if cfg.TARGET_RESOLUTION % 32 != 0:
         print("Предупреждение: разрешение не кратно 32, архитектура рассчитана на кратность 32.")
 
-    prepare_dataset(args.resolution, args.dataset_dir, args.output_dir)
+    prepare_dataset(cfg.TARGET_RESOLUTION, cfg.DATASET_DIR, cfg.OUTPUT_DIR)

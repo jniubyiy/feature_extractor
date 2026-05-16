@@ -1,13 +1,17 @@
 IMAGE_SIZE = 512
 
 COMPRESSOR_CONFIG = {
-    "base_dim": 64,
-    "num_blocks": 2
+    "base_dim": 32,
+    "num_blocks": 2,
+    "expansion_factor": 2,
+    "compressed_channels": 12          # 6 каналов
 }
 
 DECOMPRESSOR_CONFIG = {
-    "base_dim": 64,
-    "num_blocks": 2
+    "base_dim": 32,
+    "num_blocks": 2,
+    "expansion_factor": 2,
+    "compressed_channels": 12          # 6 каналов на входе
 }
 
 # Декодер для визуализации парнетов (из основного автоэнкодера)
@@ -22,11 +26,11 @@ COMPRESSOR_DEVICE_STR = "cuda:0"
 DECOMPRESSOR_DEVICE_STR = "cuda:0"
 DECODER_DEVICE_STR = "cuda:0"          # устройство для декодера при тестах
 
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 LEARNING_RATE = 0.00001
-NUM_EPOCHS = 1000
+NUM_EPOCHS = 10000
 
-MAX_TRAIN_IMAGES = 200
+MAX_TRAIN_IMAGES = 1
 
 DATASET_DIR = "./prepared_dataset_parnet"
 MODELS_DIR = "./models_compressor"
@@ -40,10 +44,10 @@ SAVE_EVERY_EPOCHS = 1
 MAX_CHECKPOINTS = 5
 
 VALIDATION_SPLIT = 10
-VAL_EVERY_EPOCHS = 1
+VAL_EVERY_EPOCHS = 200
 
-TEST_EVERY_EPOCHS = 2
-NUM_TEST_EXAMPLES = 10
+TEST_EVERY_EPOCHS = 400
+NUM_TEST_EXAMPLES = 1
 TEST_SEED = 123
 
 RANDOM_SEED = 42

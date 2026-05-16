@@ -32,13 +32,10 @@ class ParnetDataset(Dataset):
 def collate_fn(batch):
     return torch.stack(batch, dim=0)
 
-# ---------------------- Потери (ГИПОТЕТИЧЕСКАЯ) ----------------------
+# ---------------------- Потери ----------------------
 def difference_loss(pred, target):
-    """
-    Гипотетическая потеря: log(1 + |pred - target|).
-    Высокая чувствительность к малым отклонениям, низкая к большим.
-    """
-    return torch.mean(torch.log(1.0 + torch.abs(pred - target)))
+    """Устойчивая L1 потеря (средняя абсолютная ошибка) с множителем 2."""
+    return 2.0 * torch.mean(torch.abs(pred - target))
 
 def compute_psnr(pred, target):
     mse = F.mse_loss(pred, target)
@@ -117,7 +114,7 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
                 parnet_comp = parnets.to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnets.to(DECOMPRESSOR_DEVICE)
 
-            compressed = compressor(parnet_comp)
+            compressed = compressor(parnet_comp)  # [B,6,H/2,W/2]
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
                 compressed = compressed.to(DECOMPRESSOR_DEVICE)
             reconstructed = decompressor(compressed)
@@ -140,7 +137,7 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
 
     examples = []
     for idx in indices:
-        parnet = val_dataset[idx]
+        parnet = val_dataset[idx]  # [3,H,W]
         eid = int(os.path.splitext(os.path.basename(val_dataset.files[idx]))[0])
         if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
             parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
@@ -382,7 +379,7 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp):
             parnet_decomp = parnets.to(DECOMPRESSOR_DEVICE)
 
         with torch.no_grad():
-            compressed = compressor(parnet_comp)
+            compressed = compressor(parnet_comp)  # [B,6,H/2,W/2]
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
                 compressed = compressed.to(DECOMPRESSOR_DEVICE)
 
