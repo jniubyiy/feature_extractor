@@ -6,7 +6,6 @@ from model_Autoencoder import Encoder
 from config_training_models_Encoder_Decoder import ENCODER_CONFIG
 import config_preparing_the_dataset_parnet as cfg
 
-
 def process_single_image(args_tuple):
     """
     Загружает .pt файл (изображение), прогоняет через энкодер и сохраняет парнет.
@@ -20,8 +19,8 @@ def process_single_image(args_tuple):
     try:
         # Загружаем тензор изображения
         data = torch.load(file_path, map_location='cpu', weights_only=False)
-        image = data['image']                     # [0,1] (C, H, W)
-        image = image.unsqueeze(0) * 2 - 1        # [0,1] -> [-1,1], батч размерности 1
+        image = data['image']           # [0,1] (C, H, W)
+        image = image.unsqueeze(0) * 2 - 1   # [0,1] -> [-1,1], батч размерности 1
 
         # Создаём энкодер и загружаем веса
         model = Encoder(**ENCODER_CONFIG).to(device)
@@ -29,17 +28,18 @@ def process_single_image(args_tuple):
         model.load_state_dict(state_dict)
         model.eval()
 
-        # Инференс
+        # Инференс – парнет теперь без ограничения диапазона, не содержит нулей
         with torch.no_grad():
-            parnet = model(image.to(device))       # [1, 3, H, W]
+            parnet = model(image.to(device))   # [1, 3, H, W]
 
         # Сохраняем парнет (убираем размерность батча)
         save_path = output_path / f"{file_path.stem}.pt"
         torch.save({"parnet": parnet.squeeze(0).cpu()}, save_path)
+
         return (file_path.name, "OK")
+
     except Exception as e:
         return (file_path.name, f"ERROR: {e}")
-
 
 def prepare_dataset_parnet():
     dataset_path = Path(cfg.DATASET_DIR)
@@ -88,7 +88,6 @@ def prepare_dataset_parnet():
                 print(f"FAIL: {fname} – исключение в процессе: {e}")
 
     print(f"Готово. Парнеты сохранены в {output_path}")
-
 
 if __name__ == "__main__":
     prepare_dataset_parnet()

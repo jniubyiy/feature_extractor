@@ -6,7 +6,6 @@ from model_ParnetCompressor import ParnetCompressor
 from config_training_models_Compressor_Decompressor import COMPRESSOR_CONFIG
 import config_preparing_the_dataset_compressed as cfg
 
-
 def process_single_parnet(args_tuple):
     """
     Загружает .pt файл с парнетом, прогоняет через компрессор и сохраняет сжатый парнет.
@@ -20,8 +19,8 @@ def process_single_parnet(args_tuple):
     try:
         # Загружаем парнет (ожидаем ключ 'parnet')
         data = torch.load(file_path, map_location='cpu', weights_only=False)
-        parnet = data['parnet']                     # [3, H, W] в [-1,1]
-        parnet = parnet.unsqueeze(0)                # батч размерности 1
+        parnet = data['parnet']          # [3, H, W], значения не ограничены
+        parnet = parnet.unsqueeze(0)     # батч размерности 1
 
         # Создаём компрессор и загружаем веса
         model = ParnetCompressor(**COMPRESSOR_CONFIG).to(device)
@@ -35,11 +34,17 @@ def process_single_parnet(args_tuple):
 
         # Сохраняем сжатый парнет (убираем размерность батча)
         save_path = output_path / f"{file_path.stem}.pt"
-        torch.save({"compressed_parnet": compressed.squeeze(0).cpu()}, save_path)
+        compressed_cpu = compressed.squeeze(0).cpu()
+        torch.save({"compressed_parnet": compressed_cpu}, save_path)
+
+        # Проверка нулей
+        zero_count = (compressed_cpu == 0).sum().item()
+        if zero_count > 0:
+            return (file_path.name, f"WARNING: {zero_count} zeros found")
         return (file_path.name, "OK")
+
     except Exception as e:
         return (file_path.name, f"ERROR: {e}")
-
 
 def prepare_dataset_compressed():
     dataset_path = Path(cfg.DATASET_DIR)
@@ -80,7 +85,9 @@ def prepare_dataset_compressed():
             fname = Path(futures[future]).name
             try:
                 result = future.result()
-                if result[1] == "OK":
+                if result[1].startswith("WARNING"):
+                    print(f"WARNING: {result[0]} – {result[1]}")
+                elif result[1] == "OK":
                     print(f"OK: {result[0]}")
                 else:
                     print(f"FAIL: {result[0]} – {result[1]}")
@@ -88,7 +95,6 @@ def prepare_dataset_compressed():
                 print(f"FAIL: {fname} – исключение в процессе: {e}")
 
     print(f"Готово. Сжатые парнеты сохранены в {output_path}")
-
 
 if __name__ == "__main__":
     prepare_dataset_compressed()

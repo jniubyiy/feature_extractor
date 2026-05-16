@@ -8,7 +8,7 @@ COMPRESSOR_CONFIG = {
 }
 
 DECOMPRESSOR_CONFIG = {
-    "base_dim": 32,
+    "base_dim": 64,
     "num_blocks": 2,
     "expansion_factor": 2,
     "compressed_channels": 12          # 6 каналов на входе

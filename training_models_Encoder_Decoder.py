@@ -14,19 +14,30 @@ ENCODER_DEVICE = torch.device(ENCODER_DEVICE_STR if torch.cuda.is_available() el
 DECODER_DEVICE = torch.device(DECODER_DEVICE_STR if torch.cuda.is_available() else "cpu")
 print(f"Encoder device: {ENCODER_DEVICE}, Decoder device: {DECODER_DEVICE}")
 
-# ---------------------- Датасет ----------------------
-class ImageDataset(Dataset):
+# ---------------------- Новый параметр: вес потери схожести ----------------------
+SIMILARITY_LOSS_WEIGHT = 0.1          # коэффициент для дополнительной потери
+SIMILARITIES_FILE = os.path.join(DATASET_DIR, "similarities.pt")   # путь к файлу соседей
+
+# ---------------------- Датасет с индексами ----------------------
+class IndexedImageDataset(Dataset):
+    """
+    Возвращает изображение и его порядковый номер в списке файлов.
+    Индекс необходим для сопоставления с картой соседей.
+    """
     def __init__(self, file_list):
         self.files = file_list
     def __len__(self):
         return len(self.files)
     def __getitem__(self, idx):
         data = torch.load(self.files[idx], map_location='cpu', weights_only=False)
-        img = data['image']         # [0,1]
-        return img * 2 - 1          # -> [-1,1]
+        img = data['image']      # [0,1]
+        return img * 2 - 1, idx  # -> [-1,1], индекс
 
 def collate_fn(batch):
-    return torch.stack(batch, dim=0)
+    images, indices = zip(*batch)
+    images = torch.stack(images, dim=0)
+    indices = torch.tensor(indices, dtype=torch.long)
+    return images, indices
 
 # ---------------------- Потери ----------------------
 def difference_loss(pred, target):
@@ -38,6 +49,49 @@ def compute_psnr(pred, target):
     if mse == 0:
         return float('inf')
     return 20 * math.log10(2.0) - 10 * math.log10(mse.item())
+
+def compute_parnet_span(parnet):
+    with torch.no_grad():
+        B = parnet.shape[0]
+        flat = parnet.view(B, -1)
+        span_per_image = flat.max(dim=1).values - flat.min(dim=1).values
+        return span_per_image.mean().item()
+
+# ---------------------- Новая потеря схожести ----------------------
+def similarity_loss(parnet, indices, neighbor_map):
+    """
+    Притягивает парнеты тех изображений, которые являются ближайшими соседями.
+    parnet: [B, C, H, W]
+    indices: [B] – индексы изображений в train_dataset
+    neighbor_map: dict {int: set(int)} – множество соседей для каждого индекса
+    """
+    B = parnet.shape[0]
+    if B < 2:
+        return torch.tensor(0.0, device=parnet.device)
+    # Вычислим попарную матрицу квадратов расстояний ||p_i - p_j||^2
+    # parnet view [B, -1]
+    flat = parnet.view(B, -1)
+    dist_sq = torch.cdist(flat, flat, p=2) ** 2  # [B, B]
+
+    loss = 0.0
+    count = 0
+    for i in range(B):
+        idx_i = indices[i].item()
+        if idx_i not in neighbor_map:
+            continue
+        # Находим индексы в батче, которые являются соседями
+        for j in range(B):
+            if i == j:
+                continue
+            idx_j = indices[j].item()
+            if idx_j in neighbor_map[idx_i]:
+                loss += dist_sq[i, j]
+                count += 1
+    if count > 0:
+        loss = loss / count
+    else:
+        loss = torch.tensor(0.0, device=parnet.device)
+    return loss
 
 # ---------------------- Чекпоинты ----------------------
 def get_model_path(name, epoch):
@@ -93,28 +147,30 @@ def evaluate_reconstruction(model, loader):
     sum_diff = 0.0
     sum_total = 0.0
     sum_psnr = 0.0
+    sum_span = 0.0
     n_batches = 0
-
-    for images in loader:
+    for images, _ in loader:   # теперь loader возвращает (images, indices)
         if ENCODER_DEVICE == DECODER_DEVICE:
             im_enc = images.to(ENCODER_DEVICE)
             im_dec = im_enc
         else:
             im_enc = images.to(ENCODER_DEVICE)
             im_dec = images.to(DECODER_DEVICE)
-        rec = model(im_enc, ENCODER_DEVICE, DECODER_DEVICE)
+
+        parnet = model.encoder(im_enc)
+        rec = model.decoder(parnet)
 
         loss_diff = difference_loss(rec, im_dec)
         total = DIFF_LOSS_WEIGHT * loss_diff
-
         sum_diff += loss_diff.item()
         sum_total += total.item()
         sum_psnr += compute_psnr(rec, im_dec)
+        sum_span += compute_parnet_span(parnet)
         n_batches += 1
 
     model.encoder.train()
     model.decoder.train()
-    return (sum_diff / n_batches, sum_total / n_batches, sum_psnr / n_batches)
+    return (sum_diff / n_batches, sum_total / n_batches, sum_psnr / n_batches, sum_span / n_batches)
 
 def tensor_to_pil(t):
     arr = (t.cpu().clamp(-1, 1).numpy() + 1) / 2 * 255
@@ -129,22 +185,26 @@ def save_example(base_dir, orig, rec, metrics):
     tensor_to_pil(diff).save(os.path.join(base_dir, "difference.png"))
     with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
         f.write(f"Diff: {metrics['diff']:.6f}\nPSNR: {metrics['psnr']:.2f} dB\n")
+        f.write(f"Parnet span: {metrics['parnet_span']:.6f}\n")
 
 def run_tests(model, dataset, epoch):
     model.encoder.eval()
     model.decoder.eval()
     indices = random.sample(range(len(dataset)), min(NUM_TEST_EXAMPLES, len(dataset)))
     for idx in indices:
-        img = dataset[idx]
+        img, _ = dataset[idx]                         # теперь возвращается кортеж
         eid = int(os.path.splitext(os.path.basename(dataset.files[idx]))[0])
         im_enc = img.unsqueeze(0).to(ENCODER_DEVICE)
         im_dec = im_enc if ENCODER_DEVICE == DECODER_DEVICE else img.unsqueeze(0).to(DECODER_DEVICE)
         with torch.no_grad():
-            rec = model(im_enc, ENCODER_DEVICE, DECODER_DEVICE)
-            diff_v = difference_loss(rec, im_dec).item()
-            psnr_v = compute_psnr(rec, im_dec)
+            parnet = model.encoder(im_enc)
+            rec = model.decoder(parnet)
+        diff_v = difference_loss(rec, im_dec).item()
+        psnr_v = compute_psnr(rec, im_dec)
+        span_v = compute_parnet_span(parnet)
         base = os.path.join(TESTS_DIR, f"epoch_{epoch}", f"example_{eid}")
-        save_example(base, img, rec.squeeze(0).cpu(), {'diff': diff_v, 'psnr': psnr_v})
+        save_example(base, img, rec.squeeze(0).cpu(),
+                     {'diff': diff_v, 'psnr': psnr_v, 'parnet_span': span_v})
     model.encoder.train()
     model.decoder.train()
     if torch.cuda.is_available():
@@ -154,55 +214,56 @@ def save_all_val_examples(model, val_dataset, epoch):
     model.encoder.eval()
     model.decoder.eval()
     for idx in range(len(val_dataset)):
-        img = val_dataset[idx]
+        img, _ = val_dataset[idx]
         eid = int(os.path.splitext(os.path.basename(val_dataset.files[idx]))[0])
         im_enc = img.unsqueeze(0).to(ENCODER_DEVICE)
         im_dec = im_enc if ENCODER_DEVICE == DECODER_DEVICE else img.unsqueeze(0).to(DECODER_DEVICE)
         with torch.no_grad():
-            rec = model(im_enc, ENCODER_DEVICE, DECODER_DEVICE)
-            diff_v = difference_loss(rec, im_dec).item()
-            psnr_v = compute_psnr(rec, im_dec)
+            parnet = model.encoder(im_enc)
+            rec = model.decoder(parnet)
+        diff_v = difference_loss(rec, im_dec).item()
+        psnr_v = compute_psnr(rec, im_dec)
+        span_v = compute_parnet_span(parnet)
         base = os.path.join(VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{eid}")
-        save_example(base, img, rec.squeeze(0).cpu(), {'diff': diff_v, 'psnr': psnr_v})
+        save_example(base, img, rec.squeeze(0).cpu(),
+                     {'diff': diff_v, 'psnr': psnr_v, 'parnet_span': span_v})
     model.encoder.train()
     model.decoder.train()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# ---------------------- Обучение (две фазы) ----------------------
-def train_epoch(model, train_loader, opt_enc, opt_dec):
+# ---------------------- Обучение (две фазы) с добавленной потерей схожести ----------------------
+def train_epoch(model, train_loader, opt_enc, opt_dec, neighbor_map):
     model.encoder.train()
     model.decoder.train()
     total_loss_epoch = 0.0
+    total_span_epoch = 0.0
+    total_similarity_epoch = 0.0
     n_batches = len(train_loader)
-
-    for batch_idx, images in enumerate(train_loader):
+    for batch_idx, (images, indices) in enumerate(train_loader):
         saved_grads_enc = {}
         saved_grads_dec = {}
 
-        # Фаза 1: декодер
+        # Фаза 1: декодер (как обычно)
         for p in model.encoder.parameters():
             p.requires_grad = False
         for p in model.decoder.parameters():
             p.requires_grad = True
         opt_dec.zero_grad()
-
         if ENCODER_DEVICE == DECODER_DEVICE:
             im_enc = images.to(ENCODER_DEVICE)
             im_dec = im_enc
         else:
             im_enc = images.to(ENCODER_DEVICE)
             im_dec = images.to(DECODER_DEVICE)
-
         with torch.no_grad():
             parnet = model.encoder(im_enc)
-            if ENCODER_DEVICE != DECODER_DEVICE:
-                parnet = parnet.to(DECODER_DEVICE)
-
+        batch_span = compute_parnet_span(parnet)
+        if ENCODER_DEVICE != DECODER_DEVICE:
+            parnet = parnet.to(DECODER_DEVICE)
         rec = model.decoder(parnet)
         loss_1 = DIFF_LOSS_WEIGHT * difference_loss(rec, im_dec)
         loss_1.backward()
-
         for name, param in model.decoder.named_parameters():
             if param.grad is not None:
                 saved_grads_dec[name] = param.grad.clone().cpu()
@@ -210,26 +271,27 @@ def train_epoch(model, train_loader, opt_enc, opt_dec):
         loss1_val = loss_1.item()
         del parnet, rec, loss_1
 
-        # Фаза 2: энкодер
+        # Фаза 2: энкодер (добавляем потерю схожести)
         for p in model.encoder.parameters():
             p.requires_grad = True
         for p in model.decoder.parameters():
             p.requires_grad = False
         opt_enc.zero_grad()
-
-        parnet = model.encoder(im_enc)
+        parnet = model.encoder(im_enc)   # [B, C, H, W]
+        # Потеря схожести парнетов
+        sim_loss = similarity_loss(parnet, indices, neighbor_map)
         if ENCODER_DEVICE != DECODER_DEVICE:
             parnet = parnet.to(DECODER_DEVICE)
         rec = model.decoder(parnet)
-        loss_2 = DIFF_LOSS_WEIGHT * difference_loss(rec, im_dec)
+        loss_2 = DIFF_LOSS_WEIGHT * difference_loss(rec, im_dec) + SIMILARITY_LOSS_WEIGHT * sim_loss
         loss_2.backward()
-
         for name, param in model.encoder.named_parameters():
             if param.grad is not None:
                 saved_grads_enc[name] = param.grad.clone().cpu()
         opt_enc.zero_grad()
         loss2_val = loss_2.item()
-        del parnet, rec, loss_2
+        sim_loss_val = sim_loss.item()
+        del parnet, rec, loss_2, sim_loss
 
         # Применяем градиенты
         for name, param in model.decoder.named_parameters():
@@ -251,16 +313,21 @@ def train_epoch(model, train_loader, opt_enc, opt_dec):
         saved_grads_enc.clear()
 
         total_loss_epoch += loss1_val + loss2_val
-
+        total_span_epoch += batch_span
+        total_similarity_epoch += sim_loss_val
         print(f"Batch {batch_idx+1}/{n_batches} | "
-              f"Ph1 Diff: {loss1_val:.6f} | Ph2 Diff: {loss2_val:.6f}")
+              f"Ph1 Diff: {loss1_val:.6f} | Ph2 Diff: {loss2_val:.6f} | "
+              f"Span: {batch_span:.4f} | Sim: {sim_loss_val:.6f}")
 
-        del images, im_enc, im_dec
+        del images, indices, im_enc, im_dec
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
 
-    return total_loss_epoch / (2 * n_batches)
+    avg_loss = total_loss_epoch / (2 * n_batches)
+    avg_span = total_span_epoch / n_batches
+    avg_sim = total_similarity_epoch / n_batches
+    return avg_loss, avg_span, avg_sim
 
 def train():
     torch.manual_seed(RANDOM_SEED)
@@ -286,20 +353,63 @@ def train():
         val_files = all_files[-n_val:] if n_val > 0 else []
 
     print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
-    train_dataset = ImageDataset(train_files)
+    train_dataset = IndexedImageDataset(train_files)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_fn, pin_memory=True, num_workers=0)
+
     val_loader = None
     val_dataset = None
     if val_files:
-        val_dataset = ImageDataset(val_files)
+        val_dataset = IndexedImageDataset(val_files)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
                                 collate_fn=collate_fn, pin_memory=True, num_workers=0)
+
+    # ---------------------- Загрузка информации о соседях ----------------------
+    neighbor_map = {}
+    if os.path.exists(SIMILARITIES_FILE):
+        print("Загрузка данных о схожести изображений...")
+        data = torch.load(SIMILARITIES_FILE, map_location='cpu', weights_only=False)
+        # data – список словарей с ключами 'index' и 'neighbors'
+        # Строим словарь: индекс глобального изображения (во всех файлах) -> set(индексы соседей)
+        # У нас индексы в train_dataset совпадают с индексами в all_files (первые N_train файлов)
+        # Но файл similarities.pt содержит индексы по всем файлам в DATASET_DIR (весь набор).
+        # Так как мы используем первые MAX_TRAIN_IMAGES файлов, то индексы 0..len(all_files)-1.
+        # Для train_dataset смещения нет, индексы совпадают с глобальными.
+        for item in data:
+            idx = item['index']
+            neighbors = [n[0] for n in item['neighbors']]  # имена файлов
+            # Преобразуем имена файлов в индексы (можно использовать словарь file->index)
+            # Создадим словарь глобального индекса по имени файла
+            pass
+        # Более надёжный способ – загрузить similarities.pt как словарь file->neighbors (имена файлов),
+        # затем для train_files построить отображение file->local_index.
+        # Переделаем загрузку, чтобы не зависеть от порядка.
+        file_to_neighbors = {}
+        for item in data:
+            file = item['file']
+            # соседи как список имён файлов
+            file_to_neighbors[file] = [n[0] for n in item['neighbors']]
+
+        # Теперь для каждого train-файла находим его соседей среди train-файлов
+        train_file_to_idx = {os.path.basename(f): i for i, f in enumerate(train_files)}
+        for f in train_files:
+            fname = os.path.basename(f)
+            if fname in file_to_neighbors:
+                neighbor_files = file_to_neighbors[fname]
+                local_idx = train_file_to_idx[fname]
+                neighbor_indices = set()
+                for nf in neighbor_files:
+                    if nf in train_file_to_idx:
+                        neighbor_indices.add(train_file_to_idx[nf])
+                if neighbor_indices:
+                    neighbor_map[local_idx] = neighbor_indices
+        print(f"Построена карта соседей для {len(neighbor_map)} тренировочных изображений.")
+    else:
+        print("Файл similarities.pt не найден. Потеря схожести будет отключена.")
 
     model = Autoencoder(ENCODER_CONFIG, DECODER_CONFIG)
     model.encoder.to(ENCODER_DEVICE)
     model.decoder.to(DECODER_DEVICE)
-
     opt_enc = optim.Adam(model.encoder.parameters(), lr=LEARNING_RATE)
     opt_dec = optim.Adam(model.decoder.parameters(), lr=LEARNING_RATE)
 
@@ -307,12 +417,12 @@ def train():
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
-        avg_total = train_epoch(model, train_loader, opt_enc, opt_dec)
-        print(f"Epoch {epoch:3d}  Average Total: {avg_total:.6f}")
+        avg_total, avg_span, avg_sim = train_epoch(model, train_loader, opt_enc, opt_dec, neighbor_map)
+        print(f"Epoch {epoch:3d} Average Total: {avg_total:.6f} | Average Span: {avg_span:.4f} | Average Sim: {avg_sim:.6f}")
 
         if val_loader and epoch % VAL_EVERY_EPOCHS == 0:
-            val_diff, val_total, val_psnr = evaluate_reconstruction(model, val_loader)
-            print(f"Epoch {epoch:3d} VAL  Diff: {val_diff:.6f}  Total: {val_total:.6f}  PSNR: {val_psnr:.2f} dB")
+            val_diff, val_total, val_psnr, val_span = evaluate_reconstruction(model, val_loader)
+            print(f"Epoch {epoch:3d} VAL Diff: {val_diff:.6f} Total: {val_total:.6f} PSNR: {val_psnr:.2f} dB | Span: {val_span:.4f}")
             save_all_val_examples(model, val_dataset, epoch)
 
         if epoch % TEST_EVERY_EPOCHS == 0:

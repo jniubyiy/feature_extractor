@@ -23,7 +23,7 @@ MODEL_REGISTRY = {
 
 INPUT_SHAPES = {
     "encoder": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),
-    "decoder": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),
+    "decoder": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),       # парнет 3 канала
     "compressor": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),
     "decompressor": (4, IMG_SIZE_ENC // 2, IMG_SIZE_ENC // 2),
     "compressor_level2": (4, IMG_SIZE_ENC // 2, IMG_SIZE_ENC // 2),
@@ -37,7 +37,6 @@ def export_single_model(ckpt_path: Path, output_dir: Path):
         print(f"Пропуск {ckpt_path}: неверный формат имени")
         return
     model_name = parts[0]
-
     if model_name not in MODEL_REGISTRY:
         print(f"Пропуск {ckpt_path}: неизвестная модель '{model_name}'")
         return
@@ -46,19 +45,17 @@ def export_single_model(ckpt_path: Path, output_dir: Path):
     ModelClass, config = MODEL_REGISTRY[model_name]
     model = ModelClass(**config).to(DEVICE)
 
-    # Загружаем чекпоинт, учитывая возможный формат (полный или только state_dict)
     checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        # Полный чекпоинт (с оптимизатором и эпохой)
         state_dict = checkpoint["model_state_dict"]
     else:
-        # Только state_dict
         state_dict = checkpoint
 
     model.load_state_dict(state_dict)
     model.eval()
 
     input_shape = (1,) + INPUT_SHAPES[model_name]
+    # Для всех моделей используем randn, т.к. диапазон входа не ограничен
     example_input = torch.randn(*input_shape, device=DEVICE)
 
     try:
@@ -81,7 +78,6 @@ def main():
         Path("./models_compressor"),
         Path("./models_compressor_level2"),
     ]
-
     for base_dir in base_dirs:
         if not base_dir.exists():
             print(f"Папка {base_dir} не найдена, пропуск.")

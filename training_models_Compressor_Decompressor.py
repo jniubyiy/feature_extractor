@@ -27,7 +27,7 @@ class ParnetDataset(Dataset):
         return len(self.files)
     def __getitem__(self, idx):
         data = torch.load(self.files[idx], map_location='cpu', weights_only=False)
-        return data['parnet']  # [3, H, W] в [-1,1]
+        return data['parnet']   # [3, H, W], значения не ограничены
 
 def collate_fn(batch):
     return torch.stack(batch, dim=0)
@@ -42,6 +42,13 @@ def compute_psnr(pred, target):
     if mse == 0:
         return float('inf')
     return 20 * math.log10(2.0) - 10 * math.log10(mse.item())
+
+def compute_span(tensor):
+    """Средний размах (max-min) по батчу."""
+    B = tensor.shape[0]
+    flat = tensor.view(B, -1)
+    span_per_image = flat.max(dim=1).values - flat.min(dim=1).values
+    return span_per_image.mean().item()
 
 # ---------------------- Чекпоинты ----------------------
 def get_model_path(name, epoch):
@@ -103,8 +110,9 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
     sum_diff = 0.0
     sum_total = 0.0
     sum_psnr = 0.0
+    sum_span_compressed = 0.0
+    sum_span_reconstructed = 0.0
     n_batches = 0
-
     with torch.no_grad():
         for parnets in val_loader:
             if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
@@ -113,31 +121,31 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
             else:
                 parnet_comp = parnets.to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnets.to(DECOMPRESSOR_DEVICE)
-
-            compressed = compressor(parnet_comp)  # [B,6,H/2,W/2]
+            compressed = compressor(parnet_comp)      # [B,4,H/2,W/2]
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
                 compressed = compressed.to(DECOMPRESSOR_DEVICE)
             reconstructed = decompressor(compressed)
-
             loss_diff = difference_loss(reconstructed, parnet_decomp)
             total = PARNET_DIFF_LOSS_WEIGHT * loss_diff
-
             sum_diff += loss_diff.item()
             sum_total += total.item()
             sum_psnr += compute_psnr(reconstructed, parnet_decomp)
+            sum_span_compressed += compute_span(compressed)
+            sum_span_reconstructed += compute_span(reconstructed)
             n_batches += 1
 
     avg_diff = sum_diff / n_batches
     avg_total = sum_total / n_batches
     avg_psnr = sum_psnr / n_batches
+    avg_span_comp = sum_span_compressed / n_batches
+    avg_span_rec = sum_span_reconstructed / n_batches
 
     # Сохраняем несколько примеров
     val_dataset = val_loader.dataset
     indices = random.sample(range(len(val_dataset)), min(NUM_TEST_EXAMPLES, len(val_dataset)))
-
     examples = []
     for idx in indices:
-        parnet = val_dataset[idx]  # [3,H,W]
+        parnet = val_dataset[idx]       # [3,H,W]
         eid = int(os.path.splitext(os.path.basename(val_dataset.files[idx]))[0])
         if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
             parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
@@ -150,14 +158,18 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
                 compressed = compressed.to(DECOMPRESSOR_DEVICE)
             rec = decompressor(compressed)
-            diff_val = difference_loss(rec, parnet_decomp).item()
-            psnr_val = compute_psnr(rec, parnet_decomp)
+        diff_val = difference_loss(rec, parnet_decomp).item()
+        psnr_val = compute_psnr(rec, parnet_decomp)
+        span_comp_val = compute_span(compressed)
+        span_rec_val = compute_span(rec)
         examples.append({
             'example_id': eid,
             'original_parnet': parnet_decomp.squeeze(0).cpu(),
             'reconstructed_parnet': rec.squeeze(0).cpu(),
             'diff': diff_val,
             'psnr': psnr_val,
+            'span_compressed': span_comp_val,
+            'span_reconstructed': span_rec_val,
         })
 
     # Временно сохраняем модели и оптимизаторы
@@ -187,6 +199,7 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
         base_dir = os.path.join(VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{item['example_id']}")
         os.makedirs(base_dir, exist_ok=True)
 
+        # Визуализация парнетов: clamp(-1,1) для отображения, т.к. они теперь неограничены
         def parnet_to_pil(t):
             arr = (t.clamp(-1, 1).numpy() + 1) / 2 * 255
             arr = np.transpose(arr, (1, 2, 0)).astype(np.uint8)
@@ -209,6 +222,8 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
 
         with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
             f.write(f"Diff (hypo): {item['diff']:.6f}\nPSNR: {item['psnr']:.2f} dB\n")
+            f.write(f"Span compressed: {item['span_compressed']:.4f}\n")
+            f.write(f"Span reconstructed: {item['span_reconstructed']:.4f}\n")
 
     del decoder, examples
     gc.collect()
@@ -232,7 +247,8 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
 
     compressor.train()
     decompressor.train()
-    return compressor, opt_comp, decompressor, opt_decomp, avg_diff, avg_total, avg_psnr
+
+    return compressor, opt_comp, decompressor, opt_decomp, avg_diff, avg_total, avg_psnr, avg_span_comp, avg_span_rec
 
 # ---------------------- Тестирование ----------------------
 def collect_test_data(compressor, decompressor, dataset):
@@ -241,35 +257,33 @@ def collect_test_data(compressor, decompressor, dataset):
     random.seed(TEST_SEED)
     indices = random.sample(range(len(dataset)), min(NUM_TEST_EXAMPLES, len(dataset)))
     results = []
-
     with torch.no_grad():
         for idx in indices:
             parnet = dataset[idx]
             eid = int(os.path.splitext(os.path.basename(dataset.files[idx]))[0])
-
             if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
                 parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnet_comp
             else:
                 parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnet.unsqueeze(0).to(DECOMPRESSOR_DEVICE)
-
             compressed = compressor(parnet_comp)
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
                 compressed = compressed.to(DECOMPRESSOR_DEVICE)
             reconstructed = decompressor(compressed)
-
             diff_val = difference_loss(reconstructed, parnet_decomp).item()
             psnr_val = compute_psnr(reconstructed, parnet_decomp)
-
+            span_comp_val = compute_span(compressed)
+            span_rec_val = compute_span(reconstructed)
             results.append({
                 'example_id': eid,
                 'original_parnet': parnet_decomp.squeeze(0).cpu(),
                 'reconstructed_parnet': reconstructed.squeeze(0).cpu(),
                 'diff': diff_val,
                 'psnr': psnr_val,
+                'span_compressed': span_comp_val,
+                'span_reconstructed': span_rec_val,
             })
-
     compressor.train()
     decompressor.train()
     return results
@@ -300,6 +314,8 @@ def save_example_images(base_dir, item, decoder):
 
     with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
         f.write(f"Diff (hypo): {item['diff']:.6f}\nPSNR: {item['psnr']:.2f} dB\n")
+        f.write(f"Span compressed: {item['span_compressed']:.4f}\n")
+        f.write(f"Span reconstructed: {item['span_reconstructed']:.4f}\n")
 
 def run_tests(compressor, opt_comp, decompressor, opt_decomp, dataset, epoch):
     print("Collecting test data...")
@@ -358,8 +374,9 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp):
     compressor.train()
     decompressor.train()
     total_loss_epoch = 0.0
+    total_span_comp_epoch = 0.0
+    total_span_rec_epoch = 0.0
     n_batches = len(train_loader)
-
     for batch_idx, parnets in enumerate(train_loader):
         saved_grads_comp = {}
         saved_grads_decomp = {}
@@ -370,28 +387,27 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp):
         for p in decompressor.parameters():
             p.requires_grad = True
         opt_decomp.zero_grad()
-
         if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
             parnet_comp = parnets.to(COMPRESSOR_DEVICE)
             parnet_decomp = parnet_comp
         else:
             parnet_comp = parnets.to(COMPRESSOR_DEVICE)
             parnet_decomp = parnets.to(DECOMPRESSOR_DEVICE)
-
         with torch.no_grad():
-            compressed = compressor(parnet_comp)  # [B,6,H/2,W/2]
-            if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
-                compressed = compressed.to(DECOMPRESSOR_DEVICE)
-
+            compressed = compressor(parnet_comp)      # [B,4,H/2,W/2]
+        if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
+            compressed = compressed.to(DECOMPRESSOR_DEVICE)
         rec = decompressor(compressed)
         loss_1 = PARNET_DIFF_LOSS_WEIGHT * difference_loss(rec, parnet_decomp)
         loss_1.backward()
-
         for name, param in decompressor.named_parameters():
             if param.grad is not None:
                 saved_grads_decomp[name] = param.grad.clone().cpu()
         opt_decomp.zero_grad()
         loss1_val = loss_1.item()
+        # Считаем span
+        span_comp_batch = compute_span(compressed)
+        span_rec_batch = compute_span(rec)
         del compressed, rec, loss_1
 
         # Фаза 2: компрессор
@@ -400,14 +416,12 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp):
         for p in decompressor.parameters():
             p.requires_grad = False
         opt_comp.zero_grad()
-
         compressed = compressor(parnet_comp)
         if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
             compressed = compressed.to(DECOMPRESSOR_DEVICE)
         rec = decompressor(compressed)
         loss_2 = PARNET_DIFF_LOSS_WEIGHT * difference_loss(rec, parnet_decomp)
         loss_2.backward()
-
         for name, param in compressor.named_parameters():
             if param.grad is not None:
                 saved_grads_comp[name] = param.grad.clone().cpu()
@@ -435,16 +449,21 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp):
         saved_grads_comp.clear()
 
         total_loss_epoch += loss1_val + loss2_val
-
+        total_span_comp_epoch += span_comp_batch
+        total_span_rec_epoch += span_rec_batch
         print(f"Batch {batch_idx+1}/{n_batches} | "
-              f"Ph1 Diff: {loss1_val:.6f} | Ph2 Diff: {loss2_val:.6f}")
+              f"Ph1 Diff: {loss1_val:.6f} | Ph2 Diff: {loss2_val:.6f} | "
+              f"Span comp: {span_comp_batch:.4f} | Span rec: {span_rec_batch:.4f}")
 
         del parnets, parnet_comp, parnet_decomp
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
 
-    return total_loss_epoch / (2 * n_batches)
+    avg_loss = total_loss_epoch / (2 * n_batches)
+    avg_span_comp = total_span_comp_epoch / n_batches
+    avg_span_rec = total_span_rec_epoch / n_batches
+    return avg_loss, avg_span_comp, avg_span_rec
 
 def train():
     torch.manual_seed(RANDOM_SEED)
@@ -473,6 +492,7 @@ def train():
     train_dataset = ParnetDataset(train_files)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_fn, pin_memory=True, num_workers=0)
+
     val_loader = None
     if val_files:
         val_dataset = ParnetDataset(val_files)
@@ -481,7 +501,6 @@ def train():
 
     compressor = ParnetCompressor(**COMPRESSOR_CONFIG).to(COMPRESSOR_DEVICE)
     decompressor = ParnetDecompressor(**DECOMPRESSOR_CONFIG).to(DECOMPRESSOR_DEVICE)
-
     opt_comp = optim.Adam(compressor.parameters(), lr=LEARNING_RATE)
     opt_decomp = optim.Adam(decompressor.parameters(), lr=LEARNING_RATE)
 
@@ -489,15 +508,16 @@ def train():
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
-        avg_total = train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp)
-        print(f"Epoch {epoch:3d}  Average Total: {avg_total:.6f}")
+        avg_total, avg_span_comp, avg_span_rec = train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp)
+        print(f"Epoch {epoch:3d} Average Total: {avg_total:.6f} | Avg Span comp: {avg_span_comp:.4f} | Avg Span rec: {avg_span_rec:.4f}")
 
         if val_loader and epoch % VAL_EVERY_EPOCHS == 0:
             print(f"Running validation for epoch {epoch}...")
-            compressor, opt_comp, decompressor, opt_decomp, val_diff, val_total, val_psnr = run_validation(
+            compressor, opt_comp, decompressor, opt_decomp, val_diff, val_total, val_psnr, val_span_comp, val_span_rec = run_validation(
                 compressor, opt_comp, decompressor, opt_decomp, val_loader, epoch
             )
-            print(f"Epoch {epoch:3d} VAL  Diff: {val_diff:.6f}  Total: {val_total:.6f}  PSNR: {val_psnr:.2f} dB")
+            print(f"Epoch {epoch:3d} VAL Diff: {val_diff:.6f} Total: {val_total:.6f} PSNR: {val_psnr:.2f} dB | "
+                  f"Span comp: {val_span_comp:.4f} Span rec: {val_span_rec:.4f}")
 
         if epoch % TEST_EVERY_EPOCHS == 0:
             print(f"Running test examples for epoch {epoch}...")

@@ -1,8 +1,10 @@
 # model_ParnetCompressor.py
 """
 Модели для плавного сжатия и разжатия парнета.
-ParnetCompressor:  [B,3,H,W] -> [B,4,H/2,W/2]   (увеличение каналов, затем уменьшение размера)
-ParnetDecompressor: [B,4,H/2,W/2] -> [B,3,H,W] (восстановление)
+ParnetCompressor:   [B,3,H,W] -> [B,4,H/2,W/2]  (увеличение каналов, затем уменьшение размера)
+ParnetDecompressor: [B,4,H/2,W/2] -> [B,3,H,W]  (восстановление)
+
+Обновлено: парнет теперь без ограничения диапазона, без нулей.
 """
 import torch
 import torch.nn as nn
@@ -21,7 +23,6 @@ class ResidualBlock(nn.Module):
         x = self.conv2(x)
         return self.act(x + r)
 
-
 class ParnetCompressor(nn.Module):
     """
     Плавное сжатие:
@@ -31,7 +32,7 @@ class ParnetCompressor(nn.Module):
     4. Обработка на расширенных каналах
     5. Сжатие пространства вдвое (stride=2)
     6. Обработка на низком разрешении
-    7. Финальная проекция в compressed_channels (4) каналов
+    7. Финальная проекция в compressed_channels (4) каналов (без активации, +эпсилон против нулей)
     """
     def __init__(self, base_dim=64, num_blocks=2, expansion_factor=2, compressed_channels=4):
         super().__init__()
@@ -51,11 +52,8 @@ class ParnetCompressor(nn.Module):
         self.down = nn.Conv2d(self.high_dim, self.high_dim, 3, stride=2, padding=1)
         self.res_blocks_3 = nn.Sequential(*[ResidualBlock(self.high_dim) for _ in range(num_blocks)])
 
-        # Этап 4: проекция на выходное число каналов
-        self.to_parnet = nn.Sequential(
-            nn.Conv2d(self.high_dim, compressed_channels, 3, padding=1),
-            nn.Tanh()
-        )
+        # Этап 4: проекция на выходное число каналов (без Tanh – не ограничиваем диапазон)
+        self.to_parnet = nn.Conv2d(self.high_dim, compressed_channels, 3, padding=1)
 
     def forward(self, parnet):
         x = F.relu(self.init_conv(parnet))
@@ -64,8 +62,10 @@ class ParnetCompressor(nn.Module):
         x = self.res_blocks_2(x)
         x = F.relu(self.down(x))
         x = self.res_blocks_3(x)
-        return self.to_parnet(x)
-
+        x = self.to_parnet(x)
+        # Гарантируем отсутствие точных нулей
+        x = x + 1e-8
+        return x
 
 class ParnetDecompressor(nn.Module):
     """
@@ -76,7 +76,7 @@ class ParnetDecompressor(nn.Module):
     4. Обработка на высоком разрешении (high_dim)
     5. Сужение каналов: high_dim -> base_dim
     6. Обработка на base_dim
-    7. Финальная проекция в 3 канала
+    7. Финальная проекция в 3 канала (без Tanh, +эпсилон против нулей)
     """
     def __init__(self, base_dim=64, num_blocks=2, expansion_factor=2, compressed_channels=4):
         super().__init__()
@@ -98,11 +98,8 @@ class ParnetDecompressor(nn.Module):
         self.reduce_channels = nn.Conv2d(self.high_dim, base_dim, 1)
         self.res_blocks_3 = nn.Sequential(*[ResidualBlock(base_dim) for _ in range(num_blocks)])
 
-        # Этап 4: проекция в 3 канала
-        self.to_parnet = nn.Sequential(
-            nn.Conv2d(base_dim, 3, 3, padding=1),
-            nn.Tanh()
-        )
+        # Этап 4: проекция в 3 канала (без Tanh)
+        self.to_parnet = nn.Conv2d(base_dim, 3, 3, padding=1)
 
     def forward(self, compressed_parnet):
         x = F.relu(self.init_conv(compressed_parnet))
@@ -111,4 +108,7 @@ class ParnetDecompressor(nn.Module):
         x = self.res_blocks_2(x)
         x = F.relu(self.reduce_channels(x))
         x = self.res_blocks_3(x)
-        return self.to_parnet(x)
+        x = self.to_parnet(x)
+        # Гарантируем отсутствие точных нулей в восстановленном парнете
+        x = x + 1e-8
+        return x
