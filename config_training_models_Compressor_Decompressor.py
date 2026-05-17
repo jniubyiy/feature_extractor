@@ -1,15 +1,15 @@
 IMAGE_SIZE = 512
 
 COMPRESSOR_CONFIG = {
-    "base_dim": 32,
-    "num_blocks": 2,
+    "base_dim": 64,
+    "num_blocks": 4,
     "expansion_factor": 2,
     "compressed_channels": 12          # 6 каналов
 }
 
 DECOMPRESSOR_CONFIG = {
     "base_dim": 64,
-    "num_blocks": 2,
+    "num_blocks": 4,
     "expansion_factor": 2,
     "compressed_channels": 12          # 6 каналов на входе
 }

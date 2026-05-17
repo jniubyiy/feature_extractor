@@ -1,20 +1,17 @@
 # preparing_the_dataset.py
-
 import os
 import numpy as np
 from PIL import Image
 import torch
 from pathlib import Path
 import concurrent.futures
-
 import config_preparing_the_dataset as cfg
-
 
 def process_single_image(args_tuple):
     """
     Обрабатывает одно изображение в дочернем процессе.
     Принимает кортеж (file_path_str, target_resolution, output_dir_str)
-    и сохраняет .pt файл.
+    и сохраняет .pt файл с ключами 'image', 'mask', 'tags'.
     """
     file_path_str, target_resolution, output_dir_str = args_tuple
     file_path = Path(file_path_str)
@@ -48,15 +45,29 @@ def process_single_image(args_tuple):
         img_tensor = torch.from_numpy(np.array(canvas)).permute(2, 0, 1).float() / 255.0
         mask_tensor = torch.from_numpy(mask).float()
 
+        # Загружаем теги из соответствующего .txt файла
+        number = file_path.stem  # теперь это любое имя файла
+        tags = []
+        tag_file = file_path.with_suffix('.txt')
+        if tag_file.exists():
+            try:
+                with open(tag_file, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if content:
+                        # Разделяем запятыми, удаляем пробелы, фильтруем пустые
+                        tags = [tag.strip() for tag in content.split(',') if tag.strip()]
+            except Exception:
+                # Если не удалось прочитать, оставляем пустой список
+                pass
+
         # Сохранение
-        number = file_path.stem
         save_path = output_path / f"{number}.pt"
-        torch.save({"image": img_tensor, "mask": mask_tensor}, save_path)
+        torch.save({"image": img_tensor, "mask": mask_tensor, "tags": tags}, save_path)
 
         return (file_path.name, "OK")
+
     except Exception as e:
         return (file_path.name, f"ERROR: {e}")
-
 
 def prepare_dataset(target_resolution: int, dataset_dir: str, output_dir: str):
     """
@@ -71,11 +82,7 @@ def prepare_dataset(target_resolution: int, dataset_dir: str, output_dir: str):
     file_paths = []
     for f in sorted(dataset_path.iterdir()):
         if f.suffix.lower() in image_extensions:
-            try:
-                int(f.stem)
-            except ValueError:
-                print(f"Пропущен файл {f}: имя не является целым числом")
-                continue
+            # Больше не требуем, чтобы имя было целым числом
             file_paths.append(f)
 
     if not file_paths:
@@ -85,14 +92,12 @@ def prepare_dataset(target_resolution: int, dataset_dir: str, output_dir: str):
     print(f"Найдено {len(file_paths)} изображений. Целевое разрешение: {target_resolution}")
     print(f"Запуск параллельной обработки в {cfg.NUM_WORKERS} процессов...")
 
-    # Готовим аргументы для каждого процесса: (путь_к_файлу, разрешение, выходная_папка)
+    # Готовим аргументы для каждого процесса
     tasks = [(str(p), target_resolution, str(output_path)) for p in file_paths]
 
     # Используем ProcessPoolExecutor для параллельной обработки
     with concurrent.futures.ProcessPoolExecutor(max_workers=cfg.NUM_WORKERS) as executor:
-        # Запускаем все задачи и получаем результаты по мере завершения
         futures = {executor.submit(process_single_image, task): task[0] for task in tasks}
-
         for future in concurrent.futures.as_completed(futures):
             fname = Path(futures[future]).name
             try:
@@ -106,10 +111,7 @@ def prepare_dataset(target_resolution: int, dataset_dir: str, output_dir: str):
 
     print(f"Готово. Тензоры сохранены в {output_path}")
 
-
 if __name__ == "__main__":
-    # Проверка кратности разрешения 32
     if cfg.TARGET_RESOLUTION % 32 != 0:
         print("Предупреждение: разрешение не кратно 32, архитектура рассчитана на кратность 32.")
-
     prepare_dataset(cfg.TARGET_RESOLUTION, cfg.DATASET_DIR, cfg.OUTPUT_DIR)

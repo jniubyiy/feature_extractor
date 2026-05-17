@@ -21,14 +21,14 @@ BATCH_SIZE = 1
 LEARNING_RATE = 0.00001
 NUM_EPOCHS = 100000
 
-MAX_TRAIN_IMAGES = 400
+MAX_TRAIN_IMAGES = 427
 
 DATASET_DIR = "./prepared_dataset"
 MODELS_DIR = "./models"
 TESTS_DIR = "./tests"
 VAL_TESTS_DIR = "./val_tests"
 
-SAVE_EVERY_EPOCHS = 2
+SAVE_EVERY_EPOCHS = 1
 MAX_CHECKPOINTS = 5
 
 VALIDATION_SPLIT = 10
@@ -47,3 +47,4 @@ DIFF_LOSS_WEIGHT = 100.0
 # Новые параметры для регуляризации схожести парнетов
 SIMILARITY_LOSS_WEIGHT = 10.0   # коэффициент при similarity_loss
 SIMILARITIES_FILE = "./prepared_dataset/similarities.pt"  # путь к файлу с ближайшими соседями
+SIMILARITY_BUFFER_BATCHES = 8           # количество предыдущих батчей, хранимых в буфере сравнения (CPU)
