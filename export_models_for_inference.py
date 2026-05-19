@@ -5,10 +5,10 @@ import glob
 from pathlib import Path
 from model_Autoencoder import Encoder, Decoder
 from model_ParnetCompressor import ParnetCompressor, ParnetDecompressor
-from model_ParnetCompressorLevel2 import ParnetCompressorLevel2, ParnetDecompressorLevel2
+from model_VAEWrapper import VAEWrapper
 from config_training_models_Encoder_Decoder import ENCODER_CONFIG, DECODER_CONFIG, IMAGE_SIZE as IMG_SIZE_ENC
 from config_training_models_Compressor_Decompressor import COMPRESSOR_CONFIG, DECOMPRESSOR_CONFIG
-from config_training_models_Compressor_Decompressor_Level2 import COMPRESSOR_CONFIG as COMP2_CONFIG, DECOMPRESSOR_CONFIG as DECOMP2_CONFIG
+from config_training_VAEWrapper import COMPRESSED_CHANNELS, STOCHASTIC_PARNET_DIM, HIDDEN_DIM, IMAGE_SIZE
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -17,17 +17,17 @@ MODEL_REGISTRY = {
     "decoder": (Decoder, DECODER_CONFIG),
     "compressor": (ParnetCompressor, COMPRESSOR_CONFIG),
     "decompressor": (ParnetDecompressor, DECOMPRESSOR_CONFIG),
-    "compressor_level2": (ParnetCompressorLevel2, COMP2_CONFIG),
-    "decompressor_level2": (ParnetDecompressorLevel2, DECOMP2_CONFIG),
+    "vae_wrapper": (VAEWrapper, {"compressed_channels": COMPRESSED_CHANNELS,
+                                 "stochastic_parnet_dim": STOCHASTIC_PARNET_DIM,
+                                 "hidden_dim": HIDDEN_DIM}),
 }
 
 INPUT_SHAPES = {
     "encoder": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),
-    "decoder": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),       # парнет 3 канала
+    "decoder": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),    # парнет 3 канала
     "compressor": (3, IMG_SIZE_ENC, IMG_SIZE_ENC),
     "decompressor": (4, IMG_SIZE_ENC // 2, IMG_SIZE_ENC // 2),
-    "compressor_level2": (4, IMG_SIZE_ENC // 2, IMG_SIZE_ENC // 2),
-    "decompressor_level2": (5, IMG_SIZE_ENC // 4, IMG_SIZE_ENC // 4),
+    "vae_wrapper": (COMPRESSED_CHANNELS, IMAGE_SIZE // 2, IMAGE_SIZE // 2),
 }
 
 def export_single_model(ckpt_path: Path, output_dir: Path):
@@ -40,24 +40,18 @@ def export_single_model(ckpt_path: Path, output_dir: Path):
     if model_name not in MODEL_REGISTRY:
         print(f"Пропуск {ckpt_path}: неизвестная модель '{model_name}'")
         return
-
     print(f"Экспорт {model_name} из {ckpt_path} ...")
     ModelClass, config = MODEL_REGISTRY[model_name]
     model = ModelClass(**config).to(DEVICE)
-
     checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
     else:
         state_dict = checkpoint
-
     model.load_state_dict(state_dict)
     model.eval()
-
     input_shape = (1,) + INPUT_SHAPES[model_name]
-    # Для всех моделей используем randn, т.к. диапазон входа не ограничен
     example_input = torch.randn(*input_shape, device=DEVICE)
-
     try:
         traced_model = torch.jit.trace(model, example_input)
     except Exception as e:
@@ -67,7 +61,6 @@ def export_single_model(ckpt_path: Path, output_dir: Path):
         except Exception as e2:
             print(f"Не удалось экспортировать {model_name}: {e2}")
             return
-
     output_path = output_dir / f"{model_name}_inference.pt"
     torch.jit.save(traced_model, str(output_path))
     print(f"Сохранён {output_path}")
@@ -76,7 +69,7 @@ def main():
     base_dirs = [
         Path("./models"),
         Path("./models_compressor"),
-        Path("./models_compressor_level2"),
+        Path("./models_vae_wrapper"),
     ]
     for base_dir in base_dirs:
         if not base_dir.exists():

@@ -1,94 +1,85 @@
 # model_VAEWrapper.py
 """
-Отдельный модуль для добавления стохастичности и KL-регуляризации
-поверх детерминированного сжатого парнета (выход ParnetCompressor).
-
-Используется как надстройка:
-    c = compressor(parnet)          # [B, C, H_c, W_c] – сжатый парнет
-    vae = VAEWrapper(C, latent_dim)
-    c_hat, mu, logvar = vae(c)      # c_hat – восстановленный сжатый парнет
-    loss = vae.loss(c, c_hat, mu, logvar)
-
-При инференсе:
-    - Детерминированный режим: z = mu (можно модифицировать forward)
-    - Генеративный режим: z ~ N(0, I) -> tail(z) -> c_sampled
+VAE-надстройка над сжатым парнетом с увеличенной ёмкостью.
+Добавлены остаточные блоки 1x1 и увеличена скрытая размерность.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class ResidualBlock1x1(nn.Module):
+    """Остаточный блок для поканальной обработки (kernel_size=1)."""
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=1)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        r = x
+        x = self.act(self.conv1(x))
+        x = self.conv2(x)
+        return self.act(x + r)
 
 class VAEWrapper(nn.Module):
     """
-    VAE-надстройка над сжатым парнетом.
-
     Параметры:
         compressed_channels: число каналов во входном сжатом парнете.
-        latent_dim: размерность латентного пространства (каналов).
-        hidden_dim: промежуточное число каналов в head/tail (по умолчанию 32).
+        stochastic_parnet_dim: размерность стохастического парнета (каналов).
+        hidden_dim: число каналов в скрытых слоях (по умолчанию 128).
+        num_res_blocks: количество остаточных блоков в head и tail (по умолчанию 3).
     """
-    def __init__(self, compressed_channels: int, latent_dim: int, hidden_dim: int = 32):
+    def __init__(self, compressed_channels: int, stochastic_parnet_dim: int,
+                 hidden_dim: int = 128, num_res_blocks: int = 3):
         super().__init__()
-        self.latent_dim = latent_dim
+        self.stochastic_parnet_dim = stochastic_parnet_dim
         self.compressed_channels = compressed_channels
 
-        # Голова: сжатый парнет -> параметры распределения (μ и log σ²)
-        self.head = nn.Sequential(
+        # Head: сжатый парнет -> параметры стохастического парнета (μ, log σ²)
+        head_layers = [
             nn.Conv2d(compressed_channels, hidden_dim, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, 2 * latent_dim, kernel_size=1)  # удвоенное число каналов
-        )
+            nn.ReLU(inplace=True)
+        ]
+        for _ in range(num_res_blocks):
+            head_layers.append(ResidualBlock1x1(hidden_dim))
+        head_layers.append(nn.Conv2d(hidden_dim, 2 * stochastic_parnet_dim, kernel_size=1))
+        self.head = nn.Sequential(*head_layers)
 
-        # Хвост: латентная переменная z -> восстановленный сжатый парнет
-        self.tail = nn.Sequential(
-            nn.Conv2d(latent_dim, hidden_dim, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, compressed_channels, kernel_size=1)
-        )
+        # Tail: стохастический парнет z -> восстановленный сжатый парнет
+        tail_layers = [
+            nn.Conv2d(stochastic_parnet_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(inplace=True)
+        ]
+        for _ in range(num_res_blocks):
+            tail_layers.append(ResidualBlock1x1(hidden_dim))
+        tail_layers.append(nn.Conv2d(hidden_dim, compressed_channels, kernel_size=1))
+        self.tail = nn.Sequential(*tail_layers)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Репараметризация: z = μ + ε * exp(0.5 * log σ²), ε ~ N(0, I)."""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
     def forward(self, c: torch.Tensor):
-        """
-        Принимает сжатый парнет c [B, C, H, W] и возвращает:
-            c_hat: восстановленный сжатый парнет
-            mu, logvar: параметры распределения
-        """
         params = self.head(c)
-        mu, logvar = params.chunk(2, dim=1)  # разделяем на μ и logvar по каналам
+        mu, logvar = params.chunk(2, dim=1)
         z = self.reparameterize(mu, logvar)
         c_hat = self.tail(z)
         return c_hat, mu, logvar
 
-    def loss(self, c: torch.Tensor, c_hat: torch.Tensor,
-             mu: torch.Tensor, logvar: torch.Tensor,
-             kld_weight: float = 0.001):
-        """
-        Вычисляет суммарную потерю:
-            loss = L1(c_hat, c) + kld_weight * KL(N(μ,σ²) || N(0,I))
-        Возвращает:
-            total_loss, recon_loss, kld_loss
-        """
+    def loss(self, c, c_hat, mu, logvar, kld_weight=0.001):
         recon_loss = F.l1_loss(c_hat, c)
-        # KL-дивергенция для нормального распределения
-        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kld_loss = kld_loss / c.size(0)  # усреднение по батчу
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / c.size(0)
         total = recon_loss + kld_weight * kld_loss
         return total, recon_loss, kld_loss
 
     @torch.no_grad()
     def encode_deterministic(self, c: torch.Tensor) -> torch.Tensor:
-        """Детерминированное кодирование: возвращает μ."""
         params = self.head(c)
         mu, _ = params.chunk(2, dim=1)
         return mu
 
     @torch.no_grad()
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Декодирует латентный вектор в сжатый парнет."""
         return self.tail(z)

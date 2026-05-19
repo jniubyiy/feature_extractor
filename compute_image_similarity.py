@@ -20,12 +20,12 @@ from datetime import datetime
 # ---------------------- Конфигурация ----------------------
 DATASET_DIR = "./prepared_dataset"
 OUTPUT_PATH = os.path.join(DATASET_DIR, "similarities.pt")
-TOP_K = 10
-TEMPERATURE = 0.1
+TOP_K = 50
+TEMPERATURE = 1.0
 
-WEIGHT_MSE = 0.4
-WEIGHT_SSIM = 0.4
-WEIGHT_TAGS = 0.2
+WEIGHT_MSE = 1.0
+WEIGHT_SSIM = 1.0
+WEIGHT_TAGS = 1.0
 
 SSIM_WINDOW_SIZE = 11
 SSIM_C1 = 0.01 ** 2

@@ -19,8 +19,8 @@ def process_single_image(args_tuple):
     try:
         # Загружаем тензор изображения
         data = torch.load(file_path, map_location='cpu', weights_only=False)
-        image = data['image']           # [0,1] (C, H, W)
-        image = image.unsqueeze(0) * 2 - 1   # [0,1] -> [-1,1], батч размерности 1
+        image = data['image']  # [0,1] (C, H, W)
+        image = image.unsqueeze(0) * 2 - 1  # [0,1] -> [-1,1], батч размерности 1
 
         # Создаём энкодер и загружаем веса
         model = Encoder(**ENCODER_CONFIG).to(device)
@@ -30,12 +30,11 @@ def process_single_image(args_tuple):
 
         # Инференс – парнет теперь без ограничения диапазона, не содержит нулей
         with torch.no_grad():
-            parnet = model(image.to(device))   # [1, 3, H, W]
+            parnet = model(image.to(device))  # [1, 3, H, W]
 
         # Сохраняем парнет (убираем размерность батча)
         save_path = output_path / f"{file_path.stem}.pt"
         torch.save({"parnet": parnet.squeeze(0).cpu()}, save_path)
-
         return (file_path.name, "OK")
 
     except Exception as e:
@@ -54,11 +53,11 @@ def prepare_dataset_parnet():
     file_paths = []
     for f in sorted(dataset_path.iterdir()):
         if f.suffix.lower() == '.pt':
-            try:
-                int(f.stem)
-            except ValueError:
-                print(f"Пропущен файл {f}: имя не является целым числом")
+            # Пропускаем файл similarities.pt
+            if f.name == "similarities.pt":
+                print(f"Пропущен файл {f.name} (служебный файл схожести)")
                 continue
+            # Больше не требуем, чтобы имя было целым числом
             file_paths.append(f)
 
     if not file_paths:

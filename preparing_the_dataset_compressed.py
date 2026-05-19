@@ -19,18 +19,25 @@ def process_single_parnet(args_tuple):
     try:
         # Загружаем парнет (ожидаем ключ 'parnet')
         data = torch.load(file_path, map_location='cpu', weights_only=False)
-        parnet = data['parnet']          # [3, H, W], значения не ограничены
-        parnet = parnet.unsqueeze(0)     # батч размерности 1
+        parnet = data['parnet']  # [3, H, W], значения не ограничены
+        parnet = parnet.unsqueeze(0)  # батч размерности 1
 
         # Создаём компрессор и загружаем веса
         model = ParnetCompressor(**COMPRESSOR_CONFIG).to(device)
-        state_dict = torch.load(compressor_state_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(compressor_state_path, map_location=device, weights_only=False)
+
+        # Поддержка как чистого state_dict, так и полного чекпоинта
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+
         model.load_state_dict(state_dict)
         model.eval()
 
         # Инференс
         with torch.no_grad():
-            compressed = model(parnet.to(device))   # [1, 4, H/2, W/2]
+            compressed = model(parnet.to(device))  # [1, 4, H/2, W/2]
 
         # Сохраняем сжатый парнет (убираем размерность батча)
         save_path = output_path / f"{file_path.stem}.pt"
@@ -59,11 +66,11 @@ def prepare_dataset_compressed():
     file_paths = []
     for f in sorted(dataset_path.iterdir()):
         if f.suffix.lower() == '.pt':
-            try:
-                int(f.stem)
-            except ValueError:
-                print(f"Пропущен файл {f}: имя не является целым числом")
+            # Пропускаем служебный файл similarities.pt
+            if f.name == "similarities.pt":
+                print(f"Пропущен файл {f.name} (служебный файл схожести)")
                 continue
+            # Поддерживаем любые имена файлов (цифры, буквы и т.д.)
             file_paths.append(f)
 
     if not file_paths:

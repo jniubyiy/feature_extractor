@@ -4,20 +4,20 @@ COMPRESSOR_CONFIG = {
     "base_dim": 64,
     "num_blocks": 4,
     "expansion_factor": 2,
-    "compressed_channels": 12          # 6 каналов
+    "compressed_channels": 4          # 6 каналов
 }
 
 DECOMPRESSOR_CONFIG = {
     "base_dim": 64,
     "num_blocks": 4,
     "expansion_factor": 2,
-    "compressed_channels": 12          # 6 каналов на входе
+    "compressed_channels": 4          # 6 каналов на входе
 }
 
 # Декодер для визуализации парнетов (из основного автоэнкодера)
 DECODER_CONFIG = {
     "base_dim": 64,
-    "num_blocks": 3,
+    "num_blocks": 4,
     "parnet_channels": 3,
     "dropout_rate": 0.1
 }
@@ -30,7 +30,7 @@ BATCH_SIZE = 1
 LEARNING_RATE = 0.00001
 NUM_EPOCHS = 10000
 
-MAX_TRAIN_IMAGES = 1
+MAX_TRAIN_IMAGES = 427
 
 DATASET_DIR = "./prepared_dataset_parnet"
 MODELS_DIR = "./models_compressor"
@@ -38,19 +38,25 @@ TESTS_DIR = "./tests_compressor"
 VAL_TESTS_DIR = "./val_tests_compressor"
 
 # Путь к чекпоинту декодера для визуализации
-DECODER_CHECKPOINT = "./models/decoder_epoch200.pth"
+DECODER_CHECKPOINT = "./models/decoder_epoch1576.pth"
 
 SAVE_EVERY_EPOCHS = 1
 MAX_CHECKPOINTS = 5
 
 VALIDATION_SPLIT = 10
-VAL_EVERY_EPOCHS = 200
+VAL_EVERY_EPOCHS = 1
 
-TEST_EVERY_EPOCHS = 400
-NUM_TEST_EXAMPLES = 1
+TEST_EVERY_EPOCHS = 2
+NUM_TEST_EXAMPLES = 10
 TEST_SEED = 123
 
 RANDOM_SEED = 42
 CLEAR_CACHE_EACH_BATCH = True
 
 PARNET_DIFF_LOSS_WEIGHT = 100.0
+
+# Параметры регуляризации схожести сжатых парнетов
+SIMILARITY_LOSS_WEIGHT = 10.0            # коэффициент при similarity_loss
+SIMILARITIES_FILE = "./prepared_dataset/similarities.pt"
+SIMILARITY_BUFFER_BATCHES = 8            # количество предыдущих батчей в буфере сравнения
+SIMILARITY_WARMUP_BATCHES = 4            # батчей для начального прогрева буфера
