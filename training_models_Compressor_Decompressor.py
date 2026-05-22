@@ -1,5 +1,13 @@
 # training_models_Compressor_Decompressor.py
-import os, re, glob, math, random, gc
+"""
+Двухфазное обучение ParnetCompressor и ParnetDecompressor.
+Потери:
+  - difference_loss (log(1+|diff|)) – основная реконструкция парнета
+  - diff_smooth_loss_parnet – штраф за неоднородность карты разности парнетов
+  - parnet_quality_loss – качество сжатого парнета (плавность, нормализация и т.д.)
+При тестах и валидации сохраняются JSON с полными парнетами.
+"""
+import os, re, glob, math, random, gc, json
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -18,9 +26,9 @@ print(f"Compressor: {COMPRESSOR_DEVICE}, Decompressor: {DECOMPRESSOR_DEVICE}, De
 COMPRESSOR_NAME = "compressor"
 DECOMPRESSOR_NAME = "decompressor"
 
-# ---------------------- Датасет (с индексами) ----------------------
+
+# ---------------------- Датасет ----------------------
 class IndexedParnetDataset(Dataset):
-    """Загружает парнеты из .pt файлов (ключ 'parnet') и возвращает индекс."""
     def __init__(self, file_list):
         self.files = file_list
 
@@ -29,7 +37,8 @@ class IndexedParnetDataset(Dataset):
 
     def __getitem__(self, idx):
         data = torch.load(self.files[idx], map_location='cpu', weights_only=False)
-        return data['parnet'], idx   # [3, H, W], индекс
+        return data['parnet'], idx
+
 
 def collate_fn(batch):
     parnets, indices = zip(*batch)
@@ -37,10 +46,48 @@ def collate_fn(batch):
     indices = torch.tensor(indices, dtype=torch.long)
     return parnets, indices
 
+
 # ---------------------- Потери ----------------------
 def difference_loss(pred, target):
-    """Устойчивая L1 потеря (средняя абсолютная ошибка) с множителем 2."""
-    return 2.0 * torch.mean(torch.abs(pred - target))
+    return torch.mean(torch.log(1.0 + torch.abs(pred - target)))
+
+
+def diff_smooth_loss_parnet(pred, target):
+    """Штраф за резкие перепады в карте разности парнетов (по пространству)."""
+    diff = torch.abs(pred - target)          # [B, C, H, W]
+    d_h = diff[:, :, 1:, :] - diff[:, :, :-1, :]
+    d_w = diff[:, :, :, 1:] - diff[:, :, :, :-1]
+    return d_h.abs().mean() + d_w.abs().mean()
+
+
+def parnet_quality_loss(parnet, weights, num_hist_bins=100):
+    """Качество парнета: плавность, нормализация, отсутствие выбросов."""
+    diff_h = parnet[:, :, 1:, :] - parnet[:, :, :-1, :]
+    diff_w = parnet[:, :, :, 1:] - parnet[:, :, :, :-1]
+    smooth_loss = diff_h.abs().mean() + diff_w.abs().mean()
+
+    mean_loss = parnet.mean().abs()
+    std_loss = (parnet.std() - 1.0).abs()
+    max_loss = parnet.abs().max()
+
+    flat = parnet.flatten()
+    flat_min = flat.min()
+    flat_max = flat.max()
+    if flat_max - flat_min > 1e-8:
+        hist = torch.histc(flat, bins=num_hist_bins, min=flat_min.item(), max=flat_max.item())
+        hist = hist / (hist.sum() + 1e-8)
+        hist_rough = (hist[1:] - hist[:-1]).abs().mean()
+        hist_loss = hist_rough
+    else:
+        hist_loss = torch.tensor(0.0, device=parnet.device)
+
+    total = (weights['smooth'] * smooth_loss +
+             weights['mean']   * mean_loss +
+             weights['std']    * std_loss +
+             weights['max']    * max_loss +
+             weights['hist']   * hist_loss)
+    return total
+
 
 def compute_psnr(pred, target):
     mse = F.mse_loss(pred, target)
@@ -48,80 +95,18 @@ def compute_psnr(pred, target):
         return float('inf')
     return 20 * math.log10(2.0) - 10 * math.log10(mse.item())
 
+
 def compute_span(tensor):
-    """Средний размах (max-min) по батчу."""
     B = tensor.shape[0]
     flat = tensor.view(B, -1)
     span_per_image = flat.max(dim=1).values - flat.min(dim=1).values
     return span_per_image.mean().item()
 
-# ---------------------- Буфер сравнения (на CPU) ----------------------
-class SimilarityLossBuffer:
-    """
-    Хранит фиксированное количество последних сжатых парнетов и их индексов в RAM (CPU).
-    При сравнении текущий батч переносится на CPU, вычисляется потеря, результат возвращается на устройство обучения.
-    """
-    def __init__(self, max_elements, neighbor_map):
-        self.max_elements = max_elements
-        self.neighbor_map = neighbor_map
-        self.buffer_parnets = None   # CPU тензор [N, D]
-        self.buffer_indices = None   # CPU тензор [N]
-
-    def add(self, parnet_flat, indices):
-        """
-        Добавляет отсоединённый тензор в буфер (на CPU).
-        parnet_flat: тензор на GPU (или CPU), indices: тензор на CPU.
-        """
-        detached = parnet_flat.detach().cpu()
-        if self.buffer_parnets is None:
-            self.buffer_parnets = detached
-            self.buffer_indices = indices.cpu() if indices.is_cuda else indices
-        else:
-            self.buffer_parnets = torch.cat([self.buffer_parnets, detached], dim=0)
-            self.buffer_indices = torch.cat([self.buffer_indices, indices.cpu() if indices.is_cuda else indices], dim=0)
-        # Ограничиваем размер
-        if self.buffer_parnets.shape[0] > self.max_elements:
-            self.buffer_parnets = self.buffer_parnets[-self.max_elements:]
-            self.buffer_indices = self.buffer_indices[-self.max_elements:]
-
-    def compute_loss(self, parnet_flat, indices):
-        """
-        Вычисляет косинусное расстояние между текущим батчем и релевантными элементами буфера.
-        Все операции проводятся на CPU, результат возвращается на устройство parnet_flat.
-        Возвращает (loss_tensor_on_device, count).
-        """
-        B = parnet_flat.shape[0]
-        device = parnet_flat.device
-        loss = torch.tensor(0.0, device=device)
-        count = 0
-        if self.buffer_parnets is None or self.buffer_parnets.shape[0] == 0:
-            return loss, count
-        # Переносим текущий батч на CPU
-        parnet_flat_cpu = parnet_flat.detach().cpu()
-        indices_cpu = indices.cpu() if indices.is_cuda else indices
-        # Нормализуем на CPU
-        parnet_norm = F.normalize(parnet_flat_cpu, dim=1, eps=1e-8)
-        buffer_norm = F.normalize(self.buffer_parnets, dim=1, eps=1e-8)
-        cos_sim = torch.mm(parnet_norm, buffer_norm.t())  # [B, N_buf] на CPU
-        cos_dist = 1.0 - cos_sim
-        # Проходим по всем парам (i в батче, j в буфере), которые являются соседями
-        sum_loss = 0.0
-        for i in range(B):
-            idx_i = indices_cpu[i].item()
-            if idx_i not in self.neighbor_map:
-                continue
-            neighbors = self.neighbor_map[idx_i]
-            for j in range(self.buffer_indices.shape[0]):
-                if self.buffer_indices[j].item() in neighbors:
-                    sum_loss += cos_dist[i, j].item()
-                    count += 1
-        if count > 0:
-            loss = torch.tensor(sum_loss / count, device=device)
-        return loss, count
 
 # ---------------------- Чекпоинты ----------------------
 def get_model_path(name, epoch):
     return os.path.join(MODELS_DIR, f"{name}_epoch{epoch}.pth")
+
 
 def find_latest_checkpoint(name):
     files = glob.glob(os.path.join(MODELS_DIR, f"{name}_epoch*.pth"))
@@ -132,6 +117,7 @@ def find_latest_checkpoint(name):
         return int(m.group(1)) if m else -1
     latest = max(files, key=extract_epoch)
     return latest, extract_epoch(latest)
+
 
 def cleanup_old_checkpoints(name, keep=MAX_CHECKPOINTS):
     files = glob.glob(os.path.join(MODELS_DIR, f"{name}_epoch*.pth"))
@@ -144,6 +130,7 @@ def cleanup_old_checkpoints(name, keep=MAX_CHECKPOINTS):
         except OSError:
             pass
 
+
 def save_checkpoints(epoch, compressor, opt_comp, decompressor, opt_decomp):
     os.makedirs(MODELS_DIR, exist_ok=True)
     for name, model, opt in [(COMPRESSOR_NAME, compressor, opt_comp),
@@ -155,6 +142,7 @@ def save_checkpoints(epoch, compressor, opt_comp, decompressor, opt_decomp):
         }, get_model_path(name, epoch))
     cleanup_old_checkpoints(COMPRESSOR_NAME)
     cleanup_old_checkpoints(DECOMPRESSOR_NAME)
+
 
 def load_checkpoints_if_exist(compressor, opt_comp, decompressor, opt_decomp):
     loaded_epoch = 0
@@ -172,7 +160,8 @@ def load_checkpoints_if_exist(compressor, opt_comp, decompressor, opt_decomp):
                 assert epoch == loaded_epoch, f"Epoch mismatch for {name}"
     return loaded_epoch
 
-# ---------------------- Валидация (по полной схеме) ----------------------
+
+# ---------------------- Валидация / Тесты ----------------------
 def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, epoch):
     compressor.eval()
     decompressor.eval()
@@ -182,47 +171,52 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
     sum_span_compressed = 0.0
     sum_span_reconstructed = 0.0
     n_batches = 0
+
     with torch.no_grad():
-        for parnets, _ in val_loader:          # индексы не нужны
+        for parnets, _ in val_loader:
             if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
                 parnet_comp = parnets.to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnet_comp
             else:
                 parnet_comp = parnets.to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnets.to(DECOMPRESSOR_DEVICE)
-            compressed = compressor(parnet_comp)  # [B,4,H/2,W/2]
+
+            compressed = compressor(parnet_comp)
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
                 compressed = compressed.to(DECOMPRESSOR_DEVICE)
+
             reconstructed = decompressor(compressed)
             loss_diff = difference_loss(reconstructed, parnet_decomp)
             total = PARNET_DIFF_LOSS_WEIGHT * loss_diff
+
             sum_diff += loss_diff.item()
             sum_total += total.item()
             sum_psnr += compute_psnr(reconstructed, parnet_decomp)
             sum_span_compressed += compute_span(compressed)
             sum_span_reconstructed += compute_span(reconstructed)
             n_batches += 1
+
     avg_diff = sum_diff / n_batches
     avg_total = sum_total / n_batches
     avg_psnr = sum_psnr / n_batches
     avg_span_comp = sum_span_compressed / n_batches
     avg_span_rec = sum_span_reconstructed / n_batches
 
-    # Сохраняем несколько примеров
     val_dataset = val_loader.dataset
     indices = random.sample(range(len(val_dataset)), min(NUM_TEST_EXAMPLES, len(val_dataset)))
     examples = []
     for idx in indices:
-        parnet, _ = val_dataset[idx]   # распаковка (parnet, index)
-        # Для совместимости с буквами имена могут быть любыми, используем просто индекс
+        parnet, _ = val_dataset[idx]
         fname = os.path.basename(val_dataset.files[idx])
         eid = os.path.splitext(fname)[0]
+
         if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
             parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
             parnet_decomp = parnet_comp
         else:
             parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
             parnet_decomp = parnet.unsqueeze(0).to(DECOMPRESSOR_DEVICE)
+
         with torch.no_grad():
             compressed = compressor(parnet_comp)
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
@@ -232,17 +226,19 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
             psnr_val = compute_psnr(rec, parnet_decomp)
             span_comp_val = compute_span(compressed)
             span_rec_val = compute_span(rec)
-            examples.append({
-                'example_id': eid,
-                'original_parnet': parnet_decomp.squeeze(0).cpu(),
-                'reconstructed_parnet': rec.squeeze(0).cpu(),
-                'diff': diff_val,
-                'psnr': psnr_val,
-                'span_compressed': span_comp_val,
-                'span_reconstructed': span_rec_val,
-            })
 
-    # Временно сохраняем модели и оптимизаторы
+        examples.append({
+            'example_id': eid,
+            'original_parnet': parnet_decomp.squeeze(0).cpu(),
+            'reconstructed_parnet': rec.squeeze(0).cpu(),
+            'compressed_parnet': compressed.squeeze(0).cpu(),
+            'diff': diff_val,
+            'psnr': psnr_val,
+            'span_compressed': span_comp_val,
+            'span_reconstructed': span_rec_val,
+        })
+
+    # Временное сохранение и восстановление моделей
     temp_paths = []
     for name, model, opt in [(COMPRESSOR_NAME, compressor, opt_comp),
                              (DECOMPRESSOR_NAME, decompressor, opt_decomp)]:
@@ -259,50 +255,28 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Загружаем декодер
     decoder = Decoder(**DECODER_CONFIG).to(DECODER_DEVICE)
     decoder_ckpt = torch.load(DECODER_CHECKPOINT, map_location=DECODER_DEVICE, weights_only=False)
-    decoder.load_state_dict(decoder_ckpt)
+    if isinstance(decoder_ckpt, dict) and "model_state_dict" in decoder_ckpt:
+        decoder.load_state_dict(decoder_ckpt["model_state_dict"])
+    else:
+        decoder.load_state_dict(decoder_ckpt)
     decoder.eval()
 
     for item in examples:
         base_dir = os.path.join(VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{item['example_id']}")
-        os.makedirs(base_dir, exist_ok=True)
-        def parnet_to_pil(t):
-            arr = (t.clamp(-1, 1).numpy() + 1) / 2 * 255
-            arr = np.transpose(arr, (1, 2, 0)).astype(np.uint8)
-            return Image.fromarray(arr)
-
-        orig_parnet = item['original_parnet']
-        rec_parnet = item['reconstructed_parnet']
-        parnet_to_pil(orig_parnet).save(os.path.join(base_dir, "original_parnet.png"))
-        parnet_to_pil(rec_parnet).save(os.path.join(base_dir, "reconstructed_parnet.png"))
-        diff_img = (rec_parnet - orig_parnet).abs()
-        parnet_to_pil(diff_img).save(os.path.join(base_dir, "difference_parnet.png"))
-
-        with torch.no_grad():
-            orig_dec = decoder(orig_parnet.unsqueeze(0).to(DECODER_DEVICE)).squeeze(0).cpu()
-            rec_dec = decoder(rec_parnet.unsqueeze(0).to(DECODER_DEVICE)).squeeze(0).cpu()
-        parnet_to_pil(orig_dec).save(os.path.join(base_dir, "original_decoded.png"))
-        parnet_to_pil(rec_dec).save(os.path.join(base_dir, "reconstructed_decoded.png"))
-        diff_decoded = (rec_dec - orig_dec).abs()
-        parnet_to_pil(diff_decoded).save(os.path.join(base_dir, "difference_decoded.png"))
-
-        with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
-            f.write(f"Diff (hypo): {item['diff']:.6f}\nPSNR: {item['psnr']:.2f} dB\n")
-            f.write(f"Span compressed: {item['span_compressed']:.4f}\n")
-            f.write(f"Span reconstructed: {item['span_reconstructed']:.4f}\n")
+        save_example_images(base_dir, item, decoder)
 
     del decoder, examples
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Восстанавливаем модели
     compressor = ParnetCompressor(**COMPRESSOR_CONFIG).to(COMPRESSOR_DEVICE)
     decompressor = ParnetDecompressor(**DECOMPRESSOR_CONFIG).to(DECOMPRESSOR_DEVICE)
     opt_comp = optim.Adam(compressor.parameters(), lr=LEARNING_RATE)
     opt_decomp = optim.Adam(decompressor.parameters(), lr=LEARNING_RATE)
+
     for (name, model, opt), path in zip(
         [(COMPRESSOR_NAME, compressor, opt_comp), (DECOMPRESSOR_NAME, decompressor, opt_decomp)],
         temp_paths
@@ -311,28 +285,33 @@ def run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, e
         model.load_state_dict(ckpt['model_state_dict'])
         opt.load_state_dict(ckpt['optimizer_state_dict'])
         os.remove(path)
+
     compressor.train()
     decompressor.train()
+
     return compressor, opt_comp, decompressor, opt_decomp, avg_diff, avg_total, avg_psnr, avg_span_comp, avg_span_rec
 
-# ---------------------- Тестирование ----------------------
+
 def collect_test_data(compressor, decompressor, dataset):
     compressor.eval()
     decompressor.eval()
     random.seed(TEST_SEED)
     indices = random.sample(range(len(dataset)), min(NUM_TEST_EXAMPLES, len(dataset)))
     results = []
+
     with torch.no_grad():
         for idx in indices:
-            parnet, _ = dataset[idx]   # распаковка (parnet, index)
+            parnet, _ = dataset[idx]
             fname = os.path.basename(dataset.files[idx])
             eid = os.path.splitext(fname)[0]
+
             if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE:
                 parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnet_comp
             else:
                 parnet_comp = parnet.unsqueeze(0).to(COMPRESSOR_DEVICE)
                 parnet_decomp = parnet.unsqueeze(0).to(DECOMPRESSOR_DEVICE)
+
             compressed = compressor(parnet_comp)
             if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
                 compressed = compressed.to(DECOMPRESSOR_DEVICE)
@@ -341,21 +320,27 @@ def collect_test_data(compressor, decompressor, dataset):
             psnr_val = compute_psnr(reconstructed, parnet_decomp)
             span_comp_val = compute_span(compressed)
             span_rec_val = compute_span(reconstructed)
+
             results.append({
                 'example_id': eid,
                 'original_parnet': parnet_decomp.squeeze(0).cpu(),
                 'reconstructed_parnet': reconstructed.squeeze(0).cpu(),
+                'compressed_parnet': compressed.squeeze(0).cpu(),
                 'diff': diff_val,
                 'psnr': psnr_val,
                 'span_compressed': span_comp_val,
                 'span_reconstructed': span_rec_val,
             })
+
     compressor.train()
     decompressor.train()
     return results
 
+
 def save_example_images(base_dir, item, decoder):
+    """Сохраняет изображения, метрики и JSON всех парнетов."""
     os.makedirs(base_dir, exist_ok=True)
+
     def parnet_to_pil(t):
         arr = (t.clamp(-1, 1).numpy() + 1) / 2 * 255
         arr = np.transpose(arr, (1, 2, 0)).astype(np.uint8)
@@ -363,24 +348,39 @@ def save_example_images(base_dir, item, decoder):
 
     orig_parnet = item['original_parnet']
     rec_parnet = item['reconstructed_parnet']
+    comp_parnet = item['compressed_parnet']
+
+    # Изображения парнетов (как RGB)
     parnet_to_pil(orig_parnet).save(os.path.join(base_dir, "original_parnet.png"))
     parnet_to_pil(rec_parnet).save(os.path.join(base_dir, "reconstructed_parnet.png"))
     diff_img = (rec_parnet - orig_parnet).abs()
     parnet_to_pil(diff_img).save(os.path.join(base_dir, "difference_parnet.png"))
 
+    # Декодированные изображения
     decoder.eval()
     with torch.no_grad():
         orig_img = decoder(orig_parnet.unsqueeze(0).to(DECODER_DEVICE)).squeeze(0).cpu()
         rec_img = decoder(rec_parnet.unsqueeze(0).to(DECODER_DEVICE)).squeeze(0).cpu()
+
     parnet_to_pil(orig_img).save(os.path.join(base_dir, "original_decoded.png"))
     parnet_to_pil(rec_img).save(os.path.join(base_dir, "reconstructed_decoded.png"))
     diff_decoded = (rec_img - orig_img).abs()
     parnet_to_pil(diff_decoded).save(os.path.join(base_dir, "difference_decoded.png"))
 
+    # Метрики
     with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
         f.write(f"Diff (hypo): {item['diff']:.6f}\nPSNR: {item['psnr']:.2f} dB\n")
         f.write(f"Span compressed: {item['span_compressed']:.4f}\n")
         f.write(f"Span reconstructed: {item['span_reconstructed']:.4f}\n")
+
+    # Сохранение тензоров в JSON
+    for name, tensor in [("original_parnet", orig_parnet),
+                         ("reconstructed_parnet", rec_parnet),
+                         ("compressed_parnet", comp_parnet)]:
+        json_path = os.path.join(base_dir, f"{name}.json")
+        with open(json_path, 'w') as f:
+            json.dump(tensor.tolist(), f)
+
 
 def run_tests(compressor, opt_comp, decompressor, opt_decomp, dataset, epoch):
     print("Collecting test data...")
@@ -404,7 +404,10 @@ def run_tests(compressor, opt_comp, decompressor, opt_decomp, dataset, epoch):
 
     decoder = Decoder(**DECODER_CONFIG).to(DECODER_DEVICE)
     decoder_ckpt = torch.load(DECODER_CHECKPOINT, map_location=DECODER_DEVICE, weights_only=False)
-    decoder.load_state_dict(decoder_ckpt)
+    if isinstance(decoder_ckpt, dict) and "model_state_dict" in decoder_ckpt:
+        decoder.load_state_dict(decoder_ckpt["model_state_dict"])
+    else:
+        decoder.load_state_dict(decoder_ckpt)
     decoder.eval()
 
     for item in test_data:
@@ -420,6 +423,7 @@ def run_tests(compressor, opt_comp, decompressor, opt_decomp, dataset, epoch):
     decompressor = ParnetDecompressor(**DECOMPRESSOR_CONFIG).to(DECOMPRESSOR_DEVICE)
     opt_comp = optim.Adam(compressor.parameters(), lr=LEARNING_RATE)
     opt_decomp = optim.Adam(decompressor.parameters(), lr=LEARNING_RATE)
+
     for (name, model, opt), path in zip(
         [(COMPRESSOR_NAME, compressor, opt_comp), (DECOMPRESSOR_NAME, decompressor, opt_decomp)],
         temp_paths
@@ -428,18 +432,21 @@ def run_tests(compressor, opt_comp, decompressor, opt_decomp, dataset, epoch):
         model.load_state_dict(ckpt['model_state_dict'])
         opt.load_state_dict(ckpt['optimizer_state_dict'])
         os.remove(path)
+
     compressor.train()
     decompressor.train()
     return compressor, opt_comp, decompressor, opt_decomp
 
-# ---------------------- Обучение (с буфером схожести) ----------------------
-def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp, buffer):
+
+# ---------------------- Обучение эпохи ----------------------
+def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp, quality_weights):
     compressor.train()
     decompressor.train()
-    total_loss_epoch = 0.0
-    total_span_comp_epoch = 0.0
-    total_span_rec_epoch = 0.0
-    total_sim_epoch = 0.0
+    total_loss1 = 0.0
+    total_loss2 = 0.0
+    total_quality = 0.0
+    total_diff_smooth_1 = 0.0
+    total_diff_smooth_2 = 0.0
     n_batches = len(train_loader)
 
     for batch_idx, (parnets, indices) in enumerate(train_loader):
@@ -461,22 +468,24 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp, bu
             parnet_decomp = parnets.to(DECOMPRESSOR_DEVICE)
 
         with torch.no_grad():
-            compressed = compressor(parnet_comp)  # [B,4,H/2,W/2]
-        if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
-            compressed = compressed.to(DECOMPRESSOR_DEVICE)
+            compressed = compressor(parnet_comp)
+            if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
+                compressed = compressed.to(DECOMPRESSOR_DEVICE)
+
         rec = decompressor(compressed)
-        loss_1 = PARNET_DIFF_LOSS_WEIGHT * difference_loss(rec, parnet_decomp)
+        loss_1 = (PARNET_DIFF_LOSS_WEIGHT * difference_loss(rec, parnet_decomp) +
+                  DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss_parnet(rec, parnet_decomp))
         loss_1.backward()
+
         for name, param in decompressor.named_parameters():
             if param.grad is not None:
                 saved_grads_decomp[name] = param.grad.clone().cpu()
         opt_decomp.zero_grad()
         loss1_val = loss_1.item()
-        span_comp_batch = compute_span(compressed)
-        span_rec_batch = compute_span(rec)
+        diff_smooth_val_1 = diff_smooth_loss_parnet(rec, parnet_decomp).item()
         del compressed, rec, loss_1
 
-        # Фаза 2: компрессор + схожесть
+        # Фаза 2: компрессор + качество сжатого парнета
         for p in compressor.parameters():
             p.requires_grad = True
         for p in decompressor.parameters():
@@ -484,22 +493,28 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp, bu
         opt_comp.zero_grad()
 
         compressed = compressor(parnet_comp)
-        compressed_flat = compressed.view(compressed.shape[0], -1)
-        sim_loss, sim_pairs = buffer.compute_loss(compressed_flat, indices)
+
+        # Потеря качества сжатого парнета
+        q_loss = parnet_quality_loss(compressed, quality_weights)
+        weighted_q = QUALITY_LOSS_WEIGHT * q_loss
+        weighted_q_val = weighted_q.item()
 
         if COMPRESSOR_DEVICE != DECOMPRESSOR_DEVICE:
             compressed = compressed.to(DECOMPRESSOR_DEVICE)
+
         rec = decompressor(compressed)
-        loss_2 = PARNET_DIFF_LOSS_WEIGHT * difference_loss(rec, parnet_decomp) + SIMILARITY_LOSS_WEIGHT * sim_loss
+        loss_2 = (PARNET_DIFF_LOSS_WEIGHT * difference_loss(rec, parnet_decomp) +
+                  DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss_parnet(rec, parnet_decomp) +
+                  weighted_q)
         loss_2.backward()
+
         for name, param in compressor.named_parameters():
             if param.grad is not None:
                 saved_grads_comp[name] = param.grad.clone().cpu()
         opt_comp.zero_grad()
         loss2_val = loss_2.item()
-        sim_loss_val = sim_loss.item()
-        compressed_flat_cpu = compressed_flat.detach().cpu()
-        del compressed, rec, loss_2, compressed_flat
+        diff_smooth_val_2 = diff_smooth_loss_parnet(rec, parnet_decomp).item()
+        del compressed, rec, loss_2
 
         # Применяем градиенты
         for name, param in decompressor.named_parameters():
@@ -520,29 +535,37 @@ def train_epoch(compressor, decompressor, train_loader, opt_comp, opt_decomp, bu
         opt_comp.zero_grad()
         saved_grads_comp.clear()
 
-        # Добавляем текущий батч в буфер (CPU)
-        buffer.add(compressed_flat_cpu, indices)
+        total_loss1 += loss1_val
+        total_loss2 += loss2_val
+        total_quality += weighted_q_val
+        total_diff_smooth_1 += diff_smooth_val_1
+        total_diff_smooth_2 += diff_smooth_val_2
 
-        total_loss_epoch += loss1_val + loss2_val
-        total_span_comp_epoch += span_comp_batch
-        total_span_rec_epoch += span_rec_batch
-        total_sim_epoch += sim_loss_val
+        # Логирование
+        span_comp_batch = compute_span(
+            compressor(parnet_comp) if COMPRESSOR_DEVICE == DECOMPRESSOR_DEVICE
+            else compressor(parnet_comp).to(DECOMPRESSOR_DEVICE)
+        )
+        span_rec_batch = compute_span(rec if 'rec' in locals() else torch.zeros(1))
 
         print(f"Batch {batch_idx+1}/{n_batches} | "
-              f"Ph1 Diff: {loss1_val:.6f} | Ph2 Diff: {loss2_val:.6f} | "
-              f"Span comp: {span_comp_batch:.4f} | Span rec: {span_rec_batch:.4f} | "
-              f"Sim: {sim_loss_val:.6f} (pairs: {sim_pairs})")
+              f"Ph1: {loss1_val:.6f} | Ph2: {loss2_val:.6f} | "
+              f"Qual: {weighted_q_val:.6f} | "
+              f"DSm1: {diff_smooth_val_1:.4f} | DSm2: {diff_smooth_val_2:.4f} | "
+              f"SpanC: {span_comp_batch:.4f} | SpanR: {span_rec_batch:.4f}")
 
-        del parnets, indices, parnet_comp, parnet_decomp, compressed_flat_cpu
+        del parnets, indices, parnet_comp, parnet_decomp
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
-        gc.collect()
+            gc.collect()
 
-    avg_loss = total_loss_epoch / (2 * n_batches)
-    avg_span_comp = total_span_comp_epoch / n_batches
-    avg_span_rec = total_span_rec_epoch / n_batches
-    avg_sim = total_sim_epoch / n_batches
-    return avg_loss, avg_span_comp, avg_span_rec, avg_sim
+    avg_loss1 = total_loss1 / n_batches
+    avg_loss2 = total_loss2 / n_batches
+    avg_quality = total_quality / n_batches
+    avg_diff_smooth_1 = total_diff_smooth_1 / n_batches
+    avg_diff_smooth_2 = total_diff_smooth_2 / n_batches
+    return avg_loss1, avg_loss2, avg_quality, avg_diff_smooth_1, avg_diff_smooth_2
+
 
 def train():
     torch.manual_seed(RANDOM_SEED)
@@ -550,7 +573,6 @@ def train():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
 
-    # Список файлов – сортировка по имени (лексикографически), поддерживает буквы и цифры
     all_files = sorted(
         [os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith('.pt')],
         key=lambda x: os.path.basename(x)
@@ -569,96 +591,58 @@ def train():
         val_files = all_files[-n_val:] if n_val > 0 else []
 
     print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
+
     train_dataset = IndexedParnetDataset(train_files)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_fn, pin_memory=True, num_workers=0)
+
     val_loader = None
     if val_files:
         val_dataset = IndexedParnetDataset(val_files)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
                                 collate_fn=collate_fn, pin_memory=True, num_workers=0)
 
-    # Загрузка карты соседей
-    neighbor_map = {}
-    if os.path.exists(SIMILARITIES_FILE):
-        print("Загрузка данных о схожести изображений...")
-        data = torch.load(SIMILARITIES_FILE, map_location='cpu', weights_only=False)
-        file_to_neighbors = {}
-        for item in data:
-            file = item['file']
-            file_to_neighbors[file] = [n[0] for n in item['neighbors']]
-        train_file_to_idx = {os.path.basename(f): i for i, f in enumerate(train_files)}
-        for f in train_files:
-            fname = os.path.basename(f)
-            if fname in file_to_neighbors:
-                neighbor_files = file_to_neighbors[fname]
-                local_idx = train_file_to_idx[fname]
-                neighbor_indices = set()
-                for nf in neighbor_files:
-                    if nf in train_file_to_idx:
-                        neighbor_indices.add(train_file_to_idx[nf])
-                if neighbor_indices:
-                    neighbor_map[local_idx] = neighbor_indices
-        print(f"Построена карта соседей для {len(neighbor_map)} тренировочных изображений.")
-    else:
-        print("Файл similarities.pt не найден. Потеря схожести будет отключена.")
+    quality_weights = {
+        'smooth': QUALITY_SMOOTH_WEIGHT,
+        'mean': QUALITY_MEAN_WEIGHT,
+        'std': QUALITY_STD_WEIGHT,
+        'max': QUALITY_MAX_WEIGHT,
+        'hist': QUALITY_HIST_WEIGHT
+    }
 
     compressor = ParnetCompressor(**COMPRESSOR_CONFIG).to(COMPRESSOR_DEVICE)
     decompressor = ParnetDecompressor(**DECOMPRESSOR_CONFIG).to(DECOMPRESSOR_DEVICE)
     opt_comp = optim.Adam(compressor.parameters(), lr=LEARNING_RATE)
     opt_decomp = optim.Adam(decompressor.parameters(), lr=LEARNING_RATE)
+
     start_epoch = load_checkpoints_if_exist(compressor, opt_comp, decompressor, opt_decomp) + 1
-
-    # Создаём буфер сравнения (CPU)
-    max_buffer_elements = SIMILARITY_BUFFER_BATCHES * BATCH_SIZE
-    buffer = SimilarityLossBuffer(max_buffer_elements, neighbor_map)
-
-    # Прогрев буфера
-    warmup_batches = SIMILARITY_WARMUP_BATCHES
-    if warmup_batches > 0 and len(train_dataset) > 0:
-        print(f"Прогрев буфера на {warmup_batches} батчах...")
-        compressor.eval()
-        warmup_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                   collate_fn=collate_fn, pin_memory=True, num_workers=0)
-        with torch.no_grad():
-            for idx, (parnets, indices) in enumerate(warmup_loader):
-                if idx >= warmup_batches:
-                    break
-                parnet_comp = parnets.to(COMPRESSOR_DEVICE)
-                compressed = compressor(parnet_comp)
-                flat_compressed = compressed.view(compressed.shape[0], -1)
-                buffer.add(flat_compressed, indices)
-                print(f"  добавлен батч {idx+1}/{warmup_batches}")
-        compressor.train()
-        print("Прогрев завершён.")
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
-        avg_total, avg_span_comp, avg_span_rec, avg_sim = train_epoch(
-            compressor, decompressor, train_loader, opt_comp, opt_decomp, buffer
-        )
-        print(f"Epoch {epoch:3d} Average Total: {avg_total:.6f} | Avg Span comp: {avg_span_comp:.4f} | "
-              f"Avg Span rec: {avg_span_rec:.4f} | Avg Sim: {avg_sim:.6f}")
+        avg_loss1, avg_loss2, avg_quality, avg_ds1, avg_ds2 = train_epoch(
+            compressor, decompressor, train_loader, opt_comp, opt_decomp, quality_weights)
+        print(f"Epoch {epoch:3d} | Phase1 (Decomp): {avg_loss1:.6f} | "
+              f"Phase2 (Comp+Qual): {avg_loss2:.6f} | Avg Quality (weighted): {avg_quality:.6f}")
+        print(f"          | Avg DiffSmooth1: {avg_ds1:.4f} | Avg DiffSmooth2: {avg_ds2:.4f}")
 
         if val_loader and epoch % VAL_EVERY_EPOCHS == 0:
             print(f"Running validation for epoch {epoch}...")
-            compressor, opt_comp, decompressor, opt_decomp, val_diff, val_total, val_psnr, val_span_comp, val_span_rec = run_validation(
-                compressor, opt_comp, decompressor, opt_decomp, val_loader, epoch
-            )
+            compressor, opt_comp, decompressor, opt_decomp, val_diff, val_total, val_psnr, val_span_comp, val_span_rec = \
+                run_validation(compressor, opt_comp, decompressor, opt_decomp, val_loader, epoch)
             print(f"Epoch {epoch:3d} VAL Diff: {val_diff:.6f} Total: {val_total:.6f} PSNR: {val_psnr:.2f} dB | "
                   f"Span comp: {val_span_comp:.4f} Span rec: {val_span_rec:.4f}")
 
         if epoch % TEST_EVERY_EPOCHS == 0:
             print(f"Running test examples for epoch {epoch}...")
             compressor, opt_comp, decompressor, opt_decomp = run_tests(
-                compressor, opt_comp, decompressor, opt_decomp, train_dataset, epoch
-            )
+                compressor, opt_comp, decompressor, opt_decomp, train_dataset, epoch)
 
         if epoch % SAVE_EVERY_EPOCHS == 0:
             save_checkpoints(epoch, compressor, opt_comp, decompressor, opt_decomp)
             print(f"Checkpoints saved at epoch {epoch}")
 
     print("Training completed.")
+
 
 if __name__ == "__main__":
     train()

@@ -1,10 +1,17 @@
 # training_models_Encoder_Decoder.py
-import os, re, glob, math, random
+"""
+Обучение Encoder и Decoder с двухфазным обновлением градиентов.
+Потери:
+  - difference_loss (log(1+|diff|)) – основная реконструкция
+  - diff_smooth_loss – штраф за неоднородность карты разности
+  - parnet_quality_loss – качество парнета (плавность, нормализация и т.д.)
+При тестах и валидации сохраняется JSON с полным парнетом.
+"""
+import os, re, glob, math, random, gc, json
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import gc
 import numpy as np
 from PIL import Image
 from model_Autoencoder import Autoencoder
@@ -14,16 +21,30 @@ ENCODER_DEVICE = torch.device(ENCODER_DEVICE_STR if torch.cuda.is_available() el
 DECODER_DEVICE = torch.device(DECODER_DEVICE_STR if torch.cuda.is_available() else "cpu")
 print(f"Encoder device: {ENCODER_DEVICE}, Decoder device: {DECODER_DEVICE}")
 
-# ---------------------- Датасет с индексами ----------------------
+
+# ---------------------- Датасет с индексами (с проверкой целостности) ----------------------
 class IndexedImageDataset(Dataset):
     def __init__(self, file_list):
-        self.files = file_list
+        self.files = []
+        for f in file_list:
+            if os.path.basename(f) == "similarities.pt":
+                print(f"Skipping service file: {f}")
+                continue
+            try:
+                data = torch.load(f, map_location='cpu', weights_only=False)
+                _ = data['image']
+                self.files.append(f)
+            except Exception as e:
+                print(f"Skipping corrupted/unreadable file {f}: {e}")
+
     def __len__(self):
         return len(self.files)
+
     def __getitem__(self, idx):
         data = torch.load(self.files[idx], map_location='cpu', weights_only=False)
-        img = data['image']      # [0,1]
+        img = data['image']  # [0,1]
         return img * 2 - 1, idx  # -> [-1,1], индекс
+
 
 def collate_fn(batch):
     images, indices = zip(*batch)
@@ -31,9 +52,20 @@ def collate_fn(batch):
     indices = torch.tensor(indices, dtype=torch.long)
     return images, indices
 
+
 # ---------------------- Потери ----------------------
 def difference_loss(pred, target):
     return torch.mean(torch.log(1.0 + torch.abs(pred - target)))
+
+
+def diff_smooth_loss(pred, target):
+    """Штраф за резкие перепады в карте разности."""
+    diff = torch.abs(pred - target)          # [B, C, H, W]
+    # вертикальные и горизонтальные разности
+    d_h = diff[:, :, 1:, :] - diff[:, :, :-1, :]
+    d_w = diff[:, :, :, 1:] - diff[:, :, :, :-1]
+    return d_h.abs().mean() + d_w.abs().mean()
+
 
 def compute_psnr(pred, target):
     mse = F.mse_loss(pred, target)
@@ -41,85 +73,40 @@ def compute_psnr(pred, target):
         return float('inf')
     return 20 * math.log10(2.0) - 10 * math.log10(mse.item())
 
-def compute_parnet_span(parnet):
-    with torch.no_grad():
-        B = parnet.shape[0]
-        flat = parnet.view(B, -1)
-        span_per_image = flat.max(dim=1).values - flat.min(dim=1).values
-        return span_per_image.mean().item()
 
-# ---------------------- Буфер сравнения (на CPU) ----------------------
-class SimilarityLossBuffer:
-    """
-    Хранит фиксированное количество последних парнетов и их индексов в RAM (CPU).
-    При сравнении текущий батч переносится на CPU, вычисляется потеря,
-    результат возвращается на устройство обучения.
-    """
-    def __init__(self, max_elements, neighbor_map):
-        self.max_elements = max_elements
-        self.neighbor_map = neighbor_map
-        self.buffer_parnets = None   # CPU тензор [N, D]
-        self.buffer_indices = None   # CPU тензор [N]
+# ---------------------- Потеря качества парнета ----------------------
+def parnet_quality_loss(parnet, weights, num_hist_bins=100):
+    diff_h = parnet[:, :, 1:, :] - parnet[:, :, :-1, :]
+    diff_w = parnet[:, :, :, 1:] - parnet[:, :, :, :-1]
+    smooth_loss = diff_h.abs().mean() + diff_w.abs().mean()
 
-    def add(self, parnet_flat, indices):
-        """
-        Добавляет отсоединённый тензор в буфер (на CPU).
-        parnet_flat: тензор на GPU (или CPU), indices: тензор на CPU.
-        """
-        detached = parnet_flat.detach().cpu()
-        if self.buffer_parnets is None:
-            self.buffer_parnets = detached
-            self.buffer_indices = indices.cpu() if indices.is_cuda else indices
-        else:
-            self.buffer_parnets = torch.cat([self.buffer_parnets, detached], dim=0)
-            self.buffer_indices = torch.cat([self.buffer_indices, indices.cpu() if indices.is_cuda else indices], dim=0)
-        # Ограничиваем размер
-        if self.buffer_parnets.shape[0] > self.max_elements:
-            self.buffer_parnets = self.buffer_parnets[-self.max_elements:]
-            self.buffer_indices = self.buffer_indices[-self.max_elements:]
+    mean_loss = parnet.mean().abs()
+    std_loss = (parnet.std() - 1.0).abs()
+    max_loss = parnet.abs().max()
 
-    def compute_loss(self, parnet_flat, indices):
-        """
-        Вычисляет косинусное расстояние между текущим батчем и релевантными
-        элементами буфера. Все операции проводятся на CPU, результат возвращается
-        на устройство parnet_flat.
-        Возвращает (loss_tensor_on_device, count).
-        """
-        B = parnet_flat.shape[0]
-        device = parnet_flat.device
-        loss = torch.tensor(0.0, device=device)
-        count = 0
-        if self.buffer_parnets is None or self.buffer_parnets.shape[0] == 0:
-            return loss, count
+    flat = parnet.flatten()
+    flat_min = flat.min()
+    flat_max = flat.max()
+    if flat_max - flat_min > 1e-8:
+        hist = torch.histc(flat, bins=num_hist_bins, min=flat_min.item(), max=flat_max.item())
+        hist = hist / (hist.sum() + 1e-8)
+        hist_rough = (hist[1:] - hist[:-1]).abs().mean()
+        hist_loss = hist_rough
+    else:
+        hist_loss = torch.tensor(0.0, device=parnet.device)
 
-        # Переносим текущий батч на CPU
-        parnet_flat_cpu = parnet_flat.detach().cpu()
-        indices_cpu = indices.cpu() if indices.is_cuda else indices
+    total = (weights['smooth'] * smooth_loss +
+             weights['mean']   * mean_loss +
+             weights['std']    * std_loss +
+             weights['max']    * max_loss +
+             weights['hist']   * hist_loss)
+    return total
 
-        # Нормализуем на CPU
-        parnet_norm = F.normalize(parnet_flat_cpu, dim=1, eps=1e-8)
-        buffer_norm = F.normalize(self.buffer_parnets, dim=1, eps=1e-8)
-        cos_sim = torch.mm(parnet_norm, buffer_norm.t())   # [B, N_buf] на CPU
-        cos_dist = 1.0 - cos_sim
-
-        # Проходим по всем парам (i в батче, j в буфере), которые являются соседями
-        sum_loss = 0.0
-        for i in range(B):
-            idx_i = indices_cpu[i].item()
-            if idx_i not in self.neighbor_map:
-                continue
-            neighbors = self.neighbor_map[idx_i]
-            for j in range(self.buffer_indices.shape[0]):
-                if self.buffer_indices[j].item() in neighbors:
-                    sum_loss += cos_dist[i, j].item()
-                    count += 1
-        if count > 0:
-            loss = torch.tensor(sum_loss / count, device=device)
-        return loss, count
 
 # ---------------------- Чекпоинты ----------------------
 def get_model_path(name, epoch):
     return os.path.join(MODELS_DIR, f"{name}_epoch{epoch}.pth")
+
 
 def find_latest_checkpoint(name):
     files = glob.glob(os.path.join(MODELS_DIR, f"{name}_epoch*.pth"))
@@ -130,6 +117,7 @@ def find_latest_checkpoint(name):
         return int(m.group(1)) if m else -1
     latest = max(files, key=extract_epoch)
     return latest, extract_epoch(latest)
+
 
 def cleanup_old_checkpoints(name, keep=MAX_CHECKPOINTS):
     files = glob.glob(os.path.join(MODELS_DIR, f"{name}_epoch*.pth"))
@@ -142,12 +130,14 @@ def cleanup_old_checkpoints(name, keep=MAX_CHECKPOINTS):
         except OSError:
             pass
 
+
 def save_checkpoints(epoch, model):
     os.makedirs(MODELS_DIR, exist_ok=True)
     torch.save(model.encoder.state_dict(), get_model_path('encoder', epoch))
     torch.save(model.decoder.state_dict(), get_model_path('decoder', epoch))
     cleanup_old_checkpoints('encoder')
     cleanup_old_checkpoints('decoder')
+
 
 def load_checkpoints_if_exist(model):
     loaded_epoch = 0
@@ -163,6 +153,7 @@ def load_checkpoints_if_exist(model):
                 assert epoch == loaded_epoch, f"Epoch mismatch for {name}"
     return loaded_epoch
 
+
 # ---------------------- Валидация / Тесты ----------------------
 @torch.no_grad()
 def evaluate_reconstruction(model, loader):
@@ -171,8 +162,8 @@ def evaluate_reconstruction(model, loader):
     sum_diff = 0.0
     sum_total = 0.0
     sum_psnr = 0.0
-    sum_span = 0.0
     n_batches = 0
+
     for images, _ in loader:
         if ENCODER_DEVICE == DECODER_DEVICE:
             im_enc = images.to(ENCODER_DEVICE)
@@ -180,33 +171,43 @@ def evaluate_reconstruction(model, loader):
         else:
             im_enc = images.to(ENCODER_DEVICE)
             im_dec = images.to(DECODER_DEVICE)
+
         parnet = model.encoder(im_enc)
         rec = model.decoder(parnet)
         loss_diff = difference_loss(rec, im_dec)
         total = DIFF_LOSS_WEIGHT * loss_diff
+
         sum_diff += loss_diff.item()
         sum_total += total.item()
         sum_psnr += compute_psnr(rec, im_dec)
-        sum_span += compute_parnet_span(parnet)
         n_batches += 1
+
     model.encoder.train()
     model.decoder.train()
-    return (sum_diff / n_batches, sum_total / n_batches, sum_psnr / n_batches, sum_span / n_batches)
+    return (sum_diff / n_batches, sum_total / n_batches, sum_psnr / n_batches)
+
 
 def tensor_to_pil(t):
     arr = (t.cpu().clamp(-1, 1).numpy() + 1) / 2 * 255
     arr = np.transpose(arr, (1, 2, 0)).astype(np.uint8)
     return Image.fromarray(arr)
 
-def save_example(base_dir, orig, rec, metrics):
+
+def save_example(base_dir, orig, rec, parnet, metrics):
     os.makedirs(base_dir, exist_ok=True)
     tensor_to_pil(orig).save(os.path.join(base_dir, "original.png"))
     tensor_to_pil(rec).save(os.path.join(base_dir, "reconstructed.png"))
     diff = (rec - orig).abs()
     tensor_to_pil(diff).save(os.path.join(base_dir, "difference.png"))
+
     with open(os.path.join(base_dir, "metrics.txt"), 'w') as f:
         f.write(f"Diff: {metrics['diff']:.6f}\nPSNR: {metrics['psnr']:.2f} dB\n")
-        f.write(f"Parnet span: {metrics['parnet_span']:.6f}\n")
+
+    parnet_cpu = parnet.cpu()
+    parnet_list = parnet_cpu.tolist()
+    with open(os.path.join(base_dir, "parnet_values.json"), 'w') as f:
+        json.dump(parnet_list, f)
+
 
 def run_tests(model, dataset, epoch):
     model.encoder.eval()
@@ -217,19 +218,22 @@ def run_tests(model, dataset, epoch):
         eid = os.path.splitext(os.path.basename(dataset.files[idx]))[0]
         im_enc = img.unsqueeze(0).to(ENCODER_DEVICE)
         im_dec = im_enc if ENCODER_DEVICE == DECODER_DEVICE else img.unsqueeze(0).to(DECODER_DEVICE)
+
         with torch.no_grad():
             parnet = model.encoder(im_enc)
             rec = model.decoder(parnet)
-        diff_v = difference_loss(rec, im_dec).item()
-        psnr_v = compute_psnr(rec, im_dec)
-        span_v = compute_parnet_span(parnet)
+            diff_v = difference_loss(rec, im_dec).item()
+            psnr_v = compute_psnr(rec, im_dec)
+
         base = os.path.join(TESTS_DIR, f"epoch_{epoch}", f"example_{eid}")
-        save_example(base, img, rec.squeeze(0).cpu(),
-                     {'diff': diff_v, 'psnr': psnr_v, 'parnet_span': span_v})
+        save_example(base, img, rec.squeeze(0).cpu(), parnet.squeeze(0).cpu(),
+                     {'diff': diff_v, 'psnr': psnr_v})
+
     model.encoder.train()
     model.decoder.train()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
 
 def save_all_val_examples(model, val_dataset, epoch):
     model.encoder.eval()
@@ -239,88 +243,103 @@ def save_all_val_examples(model, val_dataset, epoch):
         eid = os.path.splitext(os.path.basename(val_dataset.files[idx]))[0]
         im_enc = img.unsqueeze(0).to(ENCODER_DEVICE)
         im_dec = im_enc if ENCODER_DEVICE == DECODER_DEVICE else img.unsqueeze(0).to(DECODER_DEVICE)
+
         with torch.no_grad():
             parnet = model.encoder(im_enc)
             rec = model.decoder(parnet)
-        diff_v = difference_loss(rec, im_dec).item()
-        psnr_v = compute_psnr(rec, im_dec)
-        span_v = compute_parnet_span(parnet)
+            diff_v = difference_loss(rec, im_dec).item()
+            psnr_v = compute_psnr(rec, im_dec)
+
         base = os.path.join(VAL_TESTS_DIR, f"epoch_{epoch}", f"example_{eid}")
-        save_example(base, img, rec.squeeze(0).cpu(),
-                     {'diff': diff_v, 'psnr': psnr_v, 'parnet_span': span_v})
+        save_example(base, img, rec.squeeze(0).cpu(), parnet.squeeze(0).cpu(),
+                     {'diff': diff_v, 'psnr': psnr_v})
+
     model.encoder.train()
     model.decoder.train()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# ---------------------- Обучение (с переданным буфером) ----------------------
-def train_epoch(model, train_loader, opt_enc, opt_dec, neighbor_map, buffer):
-    """
-    buffer: экземпляр SimilarityLossBuffer, который переиспользуется между эпохами.
-    """
+
+# ---------------------- Обучение эпохи ----------------------
+def train_epoch(model, train_loader, opt_enc, opt_dec, quality_weights):
     model.encoder.train()
     model.decoder.train()
-    total_loss_epoch = 0.0
-    total_span_epoch = 0.0
-    total_similarity_epoch = 0.0
+    total_loss1 = 0.0
+    total_loss2 = 0.0
+    total_quality = 0.0
+    total_diff_smooth_1 = 0.0
+    total_diff_smooth_2 = 0.0
     n_batches = len(train_loader)
 
     for batch_idx, (images, indices) in enumerate(train_loader):
         saved_grads_enc = {}
         saved_grads_dec = {}
 
-        # Фаза 1: декодер
+        # ================= Фаза 1: декодер =================
         for p in model.encoder.parameters():
             p.requires_grad = False
         for p in model.decoder.parameters():
             p.requires_grad = True
         opt_dec.zero_grad()
+
         if ENCODER_DEVICE == DECODER_DEVICE:
             im_enc = images.to(ENCODER_DEVICE)
             im_dec = im_enc
         else:
             im_enc = images.to(ENCODER_DEVICE)
             im_dec = images.to(DECODER_DEVICE)
+
         with torch.no_grad():
             parnet = model.encoder(im_enc)
-        batch_span = compute_parnet_span(parnet)
+
         if ENCODER_DEVICE != DECODER_DEVICE:
             parnet = parnet.to(DECODER_DEVICE)
+
         rec = model.decoder(parnet)
-        loss_1 = DIFF_LOSS_WEIGHT * difference_loss(rec, im_dec)
+        loss_1 = (DIFF_LOSS_WEIGHT * difference_loss(rec, im_dec) +
+                  DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(rec, im_dec))
         loss_1.backward()
+
         for name, param in model.decoder.named_parameters():
             if param.grad is not None:
                 saved_grads_dec[name] = param.grad.clone().cpu()
         opt_dec.zero_grad()
         loss1_val = loss_1.item()
+        diff_smooth_val_1 = diff_smooth_loss(rec, im_dec).item()
         del parnet, rec, loss_1
 
-        # Фаза 2: энкодер + схожесть с буфером
+        # ================= Фаза 2: энкодер =================
         for p in model.encoder.parameters():
             p.requires_grad = True
         for p in model.decoder.parameters():
             p.requires_grad = False
         opt_enc.zero_grad()
-        parnet = model.encoder(im_enc)   # [B, C, H, W] на GPU
 
-        flat_parnet = parnet.view(parnet.shape[0], -1)
-        sim_loss, sim_pairs = buffer.compute_loss(flat_parnet, indices)
+        parnet = model.encoder(im_enc)
+
+        # Потеря качества парнета
+        q_loss = parnet_quality_loss(parnet, quality_weights)
+        weighted_q = QUALITY_LOSS_WEIGHT * q_loss
+        weighted_q_val = weighted_q.item()
 
         if ENCODER_DEVICE != DECODER_DEVICE:
             parnet = parnet.to(DECODER_DEVICE)
+
         rec = model.decoder(parnet)
-        loss_2 = DIFF_LOSS_WEIGHT * difference_loss(rec, im_dec) + SIMILARITY_LOSS_WEIGHT * sim_loss
+        loss_2 = (DIFF_LOSS_WEIGHT * difference_loss(rec, im_dec) +
+                  DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(rec, im_dec) +
+                  weighted_q)
         loss_2.backward()
+
         for name, param in model.encoder.named_parameters():
             if param.grad is not None:
                 saved_grads_enc[name] = param.grad.clone().cpu()
         opt_enc.zero_grad()
         loss2_val = loss_2.item()
-        sim_loss_val = sim_loss.item()
-        del rec, loss_2
+        diff_smooth_val_2 = diff_smooth_loss(rec, im_dec).item()
+        del rec, loss_2, parnet
 
-        # Применяем градиенты
+        # ================= Применяем градиенты =================
         for name, param in model.decoder.named_parameters():
             if name in saved_grads_dec:
                 param.grad = saved_grads_dec[name].to(param.device)
@@ -339,25 +358,28 @@ def train_epoch(model, train_loader, opt_enc, opt_dec, neighbor_map, buffer):
         opt_enc.zero_grad()
         saved_grads_enc.clear()
 
-        # Добавляем текущий батч в буфер (на CPU) – после обновления весов
-        buffer.add(flat_parnet, indices)
+        total_loss1 += loss1_val
+        total_loss2 += loss2_val
+        total_quality += weighted_q_val
+        total_diff_smooth_1 += diff_smooth_val_1
+        total_diff_smooth_2 += diff_smooth_val_2
 
-        total_loss_epoch += loss1_val + loss2_val
-        total_span_epoch += batch_span
-        total_similarity_epoch += sim_loss_val
         print(f"Batch {batch_idx+1}/{n_batches} | "
-              f"Ph1 Diff: {loss1_val:.6f} | Ph2 Diff: {loss2_val:.6f} | "
-              f"Span: {batch_span:.4f} | Sim: {sim_loss_val:.6f} (pairs: {sim_pairs})")
+              f"Ph1: {loss1_val:.6f} | Ph2: {loss2_val:.6f} | "
+              f"Qual: {weighted_q_val:.6f} | "
+              f"DiffSm1: {diff_smooth_val_1:.4f} | DiffSm2: {diff_smooth_val_2:.4f}")
 
-        del images, indices, im_enc, im_dec, parnet, flat_parnet, sim_loss
+        del images, indices, im_enc, im_dec
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
-        gc.collect()
+            gc.collect()
 
-    avg_loss = total_loss_epoch / (2 * n_batches)
-    avg_span = total_span_epoch / n_batches
-    avg_sim = total_similarity_epoch / n_batches
-    return avg_loss, avg_span, avg_sim
+    avg_loss1 = total_loss1 / n_batches
+    avg_loss2 = total_loss2 / n_batches
+    avg_quality = total_quality / n_batches
+    avg_diff_smooth_1 = total_diff_smooth_1 / n_batches
+    avg_diff_smooth_2 = total_diff_smooth_2 / n_batches
+    return avg_loss1, avg_loss2, avg_quality, avg_diff_smooth_1, avg_diff_smooth_2
 
 
 def train():
@@ -372,7 +394,7 @@ def train():
     )
     if not all_files:
         raise RuntimeError(f"No .pt files in {DATASET_DIR}")
-    print(f"Found {len(all_files)} samples.")
+    print(f"Found {len(all_files)} files. Filtering...")
 
     if MAX_TRAIN_IMAGES and MAX_TRAIN_IMAGES > 0:
         train_files = all_files[:MAX_TRAIN_IMAGES]
@@ -383,43 +405,29 @@ def train():
         train_files = all_files[:-n_val] if n_val < len(all_files) else []
         val_files = all_files[-n_val:] if n_val > 0 else []
 
-    print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
     train_dataset = IndexedImageDataset(train_files)
+    val_dataset = IndexedImageDataset(val_files) if val_files else None
+
+    print(f"Train files (valid): {len(train_dataset)}, Val files (valid): {len(val_dataset) if val_dataset else 0}")
+
+    if len(train_dataset) == 0:
+        raise RuntimeError("No valid training files found.")
+
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_fn, pin_memory=True, num_workers=0)
 
     val_loader = None
-    val_dataset = None
-    if val_files:
-        val_dataset = IndexedImageDataset(val_files)
+    if val_dataset and len(val_dataset) > 0:
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
                                 collate_fn=collate_fn, pin_memory=True, num_workers=0)
 
-    # Загрузка карты соседей
-    neighbor_map = {}
-    if os.path.exists(SIMILARITIES_FILE):
-        print("Загрузка данных о схожести изображений...")
-        data = torch.load(SIMILARITIES_FILE, map_location='cpu', weights_only=False)
-        file_to_neighbors = {}
-        for item in data:
-            file = item['file']
-            file_to_neighbors[file] = [n[0] for n in item['neighbors']]
-
-        train_file_to_idx = {os.path.basename(f): i for i, f in enumerate(train_files)}
-        for f in train_files:
-            fname = os.path.basename(f)
-            if fname in file_to_neighbors:
-                neighbor_files = file_to_neighbors[fname]
-                local_idx = train_file_to_idx[fname]
-                neighbor_indices = set()
-                for nf in neighbor_files:
-                    if nf in train_file_to_idx:
-                        neighbor_indices.add(train_file_to_idx[nf])
-                if neighbor_indices:
-                    neighbor_map[local_idx] = neighbor_indices
-        print(f"Построена карта соседей для {len(neighbor_map)} тренировочных изображений.")
-    else:
-        print("Файл similarities.pt не найден. Потеря схожести будет отключена.")
+    quality_weights = {
+        'smooth': QUALITY_SMOOTH_WEIGHT,
+        'mean': QUALITY_MEAN_WEIGHT,
+        'std': QUALITY_STD_WEIGHT,
+        'max': QUALITY_MAX_WEIGHT,
+        'hist': QUALITY_HIST_WEIGHT
+    }
 
     model = Autoencoder(ENCODER_CONFIG, DECODER_CONFIG)
     model.encoder.to(ENCODER_DEVICE)
@@ -429,37 +437,18 @@ def train():
 
     start_epoch = load_checkpoints_if_exist(model) + 1
 
-    # Создаём постоянный буфер сравнения (CPU)
-    max_buffer_elements = SIMILARITY_BUFFER_BATCHES * BATCH_SIZE
-    buffer = SimilarityLossBuffer(max_buffer_elements, neighbor_map)
-
-    # Прогрев буфера перед началом обучения
-    warmup_batches = SIMILARITY_WARMUP_BATCHES if 'SIMILARITY_WARMUP_BATCHES' in dir() else 4
-    if warmup_batches > 0 and len(train_dataset) > 0:
-        print(f"Прогрев буфера на {warmup_batches} батчах...")
-        model.encoder.eval()
-        warmup_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                                   collate_fn=collate_fn, pin_memory=True, num_workers=0)
-        with torch.no_grad():
-            for idx, (images, indices) in enumerate(warmup_loader):
-                if idx >= warmup_batches:
-                    break
-                im_enc = images.to(ENCODER_DEVICE)
-                parnet = model.encoder(im_enc)
-                flat = parnet.view(parnet.shape[0], -1)
-                buffer.add(flat, indices)
-                print(f"  добавлен батч {idx+1}/{warmup_batches}")
-        model.encoder.train()
-        print("Прогрев завершён.")
-
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
-        avg_total, avg_span, avg_sim = train_epoch(model, train_loader, opt_enc, opt_dec, neighbor_map, buffer)
-        print(f"Epoch {epoch:3d} Average Total: {avg_total:.6f} | Average Span: {avg_span:.4f} | Average Sim: {avg_sim:.6f}")
+        avg_loss1, avg_loss2, avg_quality, avg_ds1, avg_ds2 = train_epoch(
+            model, train_loader, opt_enc, opt_dec, quality_weights)
+        print(f"Epoch {epoch:3d} | Phase1 (Decoder): {avg_loss1:.6f} | "
+              f"Phase2 (Encoder+Qual): {avg_loss2:.6f} | "
+              f"Avg Quality (weighted): {avg_quality:.6f}")
+        print(f"          | Avg DiffSmooth1: {avg_ds1:.4f} | Avg DiffSmooth2: {avg_ds2:.4f}")
 
         if val_loader and epoch % VAL_EVERY_EPOCHS == 0:
-            val_diff, val_total, val_psnr, val_span = evaluate_reconstruction(model, val_loader)
-            print(f"Epoch {epoch:3d} VAL Diff: {val_diff:.6f} Total: {val_total:.6f} PSNR: {val_psnr:.2f} dB | Span: {val_span:.4f}")
+            val_diff, val_total, val_psnr = evaluate_reconstruction(model, val_loader)
+            print(f"Epoch {epoch:3d} VAL Diff: {val_diff:.6f} Total: {val_total:.6f} PSNR: {val_psnr:.2f} dB")
             save_all_val_examples(model, val_dataset, epoch)
 
         if epoch % TEST_EVERY_EPOCHS == 0:
@@ -469,6 +458,7 @@ def train():
             save_checkpoints(epoch, model)
 
     print("Training completed.")
+
 
 if __name__ == "__main__":
     train()

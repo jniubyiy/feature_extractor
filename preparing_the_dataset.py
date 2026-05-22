@@ -6,6 +6,8 @@ import torch
 from pathlib import Path
 import concurrent.futures
 import config_preparing_the_dataset as cfg
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
 
 def process_single_image(args_tuple):
     """

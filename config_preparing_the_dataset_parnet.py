@@ -4,6 +4,6 @@ import torch
 
 DATASET_DIR = "./prepared_dataset"
 OUTPUT_DIR = "./prepared_dataset_parnet"
-ENCODER_CHECKPOINT = "./models/encoder_epoch1576.pth"
+ENCODER_CHECKPOINT = "./models/encoder_epoch39.pth"
 NUM_WORKERS = 6
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
