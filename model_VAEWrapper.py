@@ -1,20 +1,71 @@
 # model_VAEWrapper.py
 """
-Разделённый VAE для сжатого парнета.
-StochasticEncoder: улучшен – использует пространственные ResidualBlock 3x3
-                   для лучшего улавливания локальных зависимостей.
-StochasticDecoder: принимает стохастический парнет, восстанавливает сжатый парнет.
-                   Внутренне обогащает вход локальной KL-дивергенцией
-                   (оценённой по соседним пикселям) для лучшего использования корреляций.
+StochasticEncoder и StochasticDecoder без ограничений диапазона.
+Архитектура как у model_Autoencoder, но с SE-блоками для устойчивости к шуму.
+Диапазон значений не ограничен (нет Tanh/clamp).
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # --------------------- Базовые блоки ---------------------
+
+class SELayer(nn.Module):
+    """Squeeze-and-Excitation: перекалибровка каналов для подавления шума."""
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class GlobalScaleBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.depthwise = nn.Conv2d(channels, channels, kernel_size=7,
+                                   padding=3, groups=channels)
+        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        residual = x
+        x = self.act(self.depthwise(x))
+        x = self.pointwise(x)
+        x = self.act(x + residual)
+        return x
+
+
+class ModulationBlock(nn.Module):
+    def __init__(self, hint_channels, target_channels):
+        super().__init__()
+        self.gamma_net = nn.Sequential(
+            nn.Conv2d(hint_channels, target_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(target_channels, target_channels, kernel_size=1)
+        )
+        self.beta_net = nn.Sequential(
+            nn.Conv2d(hint_channels, target_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(target_channels, target_channels, kernel_size=1)
+        )
+
+    def forward(self, hint, target):
+        gamma = self.gamma_net(hint)
+        beta = self.beta_net(hint)
+        return target * gamma + beta
+
+
 class ResidualBlock1x1(nn.Module):
-    """Остаточный блок для поканальной обработки (kernel_size=1)."""
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=1)
@@ -22,123 +73,160 @@ class ResidualBlock1x1(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        r = x
+        residual = x
         x = self.act(self.conv1(x))
         x = self.conv2(x)
-        return self.act(x + r)
+        x = self.act(x + residual)
+        return x
 
 
-class SpatialResidualBlock(nn.Module):
-    """Остаточный блок с пространственными свёртками 3x3 для учёта соседей."""
+# ---------- Специализированные блоки для VAE ----------
+
+class EncoderGlobalScaleBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.act = nn.ReLU(inplace=True)
+        self.block = GlobalScaleBlock(channels)
+        self.se = SELayer(channels)
 
     def forward(self, x):
-        r = x
-        x = self.act(self.conv1(x))
-        x = self.conv2(x)
-        return self.act(x + r)
+        x = self.block(x)
+        x = self.se(x)
+        return x
 
 
-# --------------------- Энкодер (улучшенный) ---------------------
-class StochasticEncoder(nn.Module):
-    """
-    Преобразует сжатый парнет (B, C, H, W) в стохастический парнет той же формы.
-    Улучшенная версия: вместо 1x1 блоков используются пространственные ResidualBlock 3x3,
-    что позволяет улавливать локальные корреляции и генерировать более информативные mu, logvar.
-    Параметры:
-        compressed_channels: число каналов входного сжатого парнета
-        stochastic_parnet_dim: размерность стохастического парнета (каналов)
-        hidden_dim: число каналов в скрытых слоях
-        num_res_blocks: количество пространственных остаточных блоков
-    """
-    def __init__(self, compressed_channels: int, stochastic_parnet_dim: int,
-                 hidden_dim: int = 128, num_res_blocks: int = 3):
+class DecoderGlobalScaleBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        # Проекция на скрытое пространство
-        self.input_proj = nn.Conv2d(compressed_channels, hidden_dim, kernel_size=1)
-        self.act = nn.ReLU(inplace=True)
+        self.block = GlobalScaleBlock(channels)
+        self.se = SELayer(channels)
 
-        # Пространственные остаточные блоки
-        res_blocks = []
-        for _ in range(num_res_blocks):
-            res_blocks.append(SpatialResidualBlock(hidden_dim))
-        self.res_blocks = nn.Sequential(*res_blocks)
+    def forward(self, x):
+        x = self.block(x)
+        x = self.se(x)
+        return x
 
-        # Финальная проекция на mu и logvar
-        self.output_proj = nn.Conv2d(hidden_dim, 2 * stochastic_parnet_dim, kernel_size=1)
 
-    def forward(self, c):
-        x = self.act(self.input_proj(c))
-        x = self.res_blocks(x)
-        params = self.output_proj(x)
-        mu, logvar = params.chunk(2, dim=1)
-        return mu, logvar
+class EncoderModulationBlock(nn.Module):
+    def __init__(self, hint_channels, target_channels):
+        super().__init__()
+        self.mod = ModulationBlock(hint_channels, target_channels)
+        self.se = SELayer(target_channels)
 
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + strength * eps * std
+    def forward(self, hint, target):
+        out = self.mod(hint, target)
+        out = self.se(out)
+        return out
 
-    @torch.no_grad()
-    def sample(self, c: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
-        mu, logvar = self.forward(c)
-        return self.reparameterize(mu, logvar, strength)
 
-    @torch.no_grad()
-    def encode_deterministic(self, c: torch.Tensor) -> torch.Tensor:
-        mu, _ = self.forward(c)
+class DecoderModulationBlock(nn.Module):
+    def __init__(self, hint_channels, target_channels):
+        super().__init__()
+        self.mod = ModulationBlock(hint_channels, target_channels)
+        self.se = SELayer(target_channels)
+
+    def forward(self, hint, target):
+        out = self.mod(hint, target)
+        out = self.se(out)
+        return out
+
+
+class EncoderResidualBlock1x1(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.res = ResidualBlock1x1(channels)
+        self.se = SELayer(channels)
+
+    def forward(self, x):
+        x = self.res(x)
+        x = self.se(x)
+        return x
+
+
+class DecoderResidualBlock1x1(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.res = ResidualBlock1x1(channels)
+        self.se = SELayer(channels)
+
+    def forward(self, x):
+        x = self.res(x)
+        x = self.se(x)
+        return x
+
+
+# ---------- Основные модели ----------
+
+class StochasticEncoder(nn.Module):
+    def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
+                 hidden_dim=128, num_res_blocks=4, **kwargs):
+        super().__init__()
+        num_blocks = num_res_blocks
+
+        self.init_conv = nn.Conv2d(compressed_channels, hidden_dim, kernel_size=3, padding=1)
+        self.global_blocks = nn.Sequential(*[
+            EncoderGlobalScaleBlock(hidden_dim) for _ in range(num_blocks)
+        ])
+        self.compress = nn.Conv2d(hidden_dim, stochastic_parnet_dim, kernel_size=3, padding=1)
+        self.mod_block = EncoderModulationBlock(hidden_dim, stochastic_parnet_dim)
+        self.refine_blocks = nn.Sequential(*[
+            EncoderResidualBlock1x1(stochastic_parnet_dim) for _ in range(num_blocks)
+        ])
+
+    def forward(self, x):
+        x = self.init_conv(x)
+        global_hint = self.global_blocks(x)
+        parnet = self.compress(x)
+        parnet = self.mod_block(global_hint, parnet)
+        parnet = self.refine_blocks(parnet)
+        mu = parnet                                    # БЕЗ Tanh
         return mu
 
+    def reparameterize(self, mu, strength=1.0):
+        noise = torch.empty_like(mu).uniform_(-1.0, 1.0)
+        z = mu + noise * strength                       # БЕЗ clamp
+        return z
 
-# --------------------- Декодер (KL‑признаки всегда активны) ---------------------
+    def kl_divergence(self, mu):
+        return 0.5 * torch.sum(mu.pow(2))
+
+
 class StochasticDecoder(nn.Module):
-    """
-    Преобразует стохастический парнет (B, C, H, W) обратно в сжатый парнет.
-    Вход: z (стохастический парнет) размерности (B, stochastic_parnet_dim, H, W).
-    Внутренне:
-      1. Вычисляет локальное среднее и дисперсию по окну 3x3.
-      2. Считает пиксельную KL-дивергенцию N(μ_local, σ²_local) || N(0,1).
-      3. Конкатенирует исходный z с картой KL-признаков (каналов: stochastic_parnet_dim * 2).
-      4. Пропускает через пространственные ResidualBlock 3x3.
-    Параметры:
-        compressed_channels: число каналов выходного сжатого парнета
-        stochastic_parnet_dim: размерность стохастического парнета (каналов)
-        hidden_dim: число каналов в скрытых слоях
-        num_res_blocks: количество пространственных остаточных блоков
-    """
-    def __init__(self, compressed_channels: int, stochastic_parnet_dim: int,
-                 hidden_dim: int = 128, num_res_blocks: int = 3):
+    def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
+                 hidden_dim=128, num_res_blocks=6, **kwargs):
         super().__init__()
-        input_channels = stochastic_parnet_dim * 2   # z + KL features
+        num_blocks = num_res_blocks
 
-        self.input_proj = nn.Conv2d(input_channels, hidden_dim, kernel_size=1)
-        self.act = nn.ReLU(inplace=True)
+        self.expand = nn.Conv2d(stochastic_parnet_dim, hidden_dim, kernel_size=3, padding=1)
+        self.global_blocks = nn.Sequential(*[
+            DecoderGlobalScaleBlock(hidden_dim) for _ in range(num_blocks)
+        ])
+        self.compress = nn.Conv2d(hidden_dim, compressed_channels, kernel_size=3, padding=1)
+        self.mod_block = DecoderModulationBlock(hidden_dim, compressed_channels)
+        self.refine_blocks = nn.Sequential(*[
+            DecoderResidualBlock1x1(compressed_channels) for _ in range(num_blocks)
+        ])
 
-        res_blocks = []
-        for _ in range(num_res_blocks):
-            res_blocks.append(SpatialResidualBlock(hidden_dim))
-        self.res_blocks = nn.Sequential(*res_blocks)
+    def forward(self, z):
+        x = self.expand(z)
+        global_hint = self.global_blocks(x)
+        mid = self.compress(x)
+        mid = self.mod_block(global_hint, mid)
+        mid = self.refine_blocks(mid)
+        out = mid                                       # БЕЗ Tanh
+        return out
 
-        self.output_proj = nn.Conv2d(hidden_dim, compressed_channels, kernel_size=1)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # Локальные статистики: среднее и дисперсия по окну 3x3
-        mu_local = F.avg_pool2d(z, kernel_size=3, stride=1, padding=1)
-        z_sq = z.pow(2)
-        var_local = F.avg_pool2d(z_sq, kernel_size=3, stride=1, padding=1) - mu_local.pow(2)
-        var_local = var_local.clamp(min=1e-8)  # стабильность логарифма
+class VAEWrapper(nn.Module):
+    def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
+                 hidden_dim=128, **kwargs):
+        super().__init__()
+        self.encoder = StochasticEncoder(compressed_channels, stochastic_parnet_dim,
+                                         hidden_dim, **kwargs)
+        self.decoder = StochasticDecoder(compressed_channels, stochastic_parnet_dim,
+                                         hidden_dim, **kwargs)
 
-        # KL(N(μ_local, σ²_local) || N(0,1)) = 0.5 * (μ² + σ² - 1 - ln σ²)
-        kl_feat = 0.5 * (mu_local.pow(2) + var_local - 1.0 - torch.log(var_local))
-
-        # Объединяем с исходным z
-        x = torch.cat([z, kl_feat], dim=1)
-
-        x = self.act(self.input_proj(x))
-        x = self.res_blocks(x)
-        x = self.output_proj(x)
-        return x
+    def forward(self, x):
+        mu = self.encoder(x)
+        z = mu
+        out = self.decoder(z)
+        return out

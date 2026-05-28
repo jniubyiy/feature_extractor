@@ -1,34 +1,50 @@
 # model_ParnetCompressor.py
 """
-Модели для плавного сжатия и разжатия парнета.
-ParnetCompressor:   [B,3,H,W] -> [B,4,H/2,W/2]
-    - добавлены поканальные (1x1) блоки для независимого анализа каждого вектора.
-ParnetDecompressor: [B,4,H/2,W/2] -> [B,3,H,W]
-    - добавлены блоки модуляции (FiLM) для независимого изменения каждого пикселя.
+ParnetCompressor и ParnetDecompressor с явными блоками сжатия/расширения.
+Все слои определены в __init__, чтобы избежать ошибок с torch.compile.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# --------------------- Базовые блоки ---------------------
-class ResidualBlock(nn.Module):
-    """Остаточный блок 3x3 (пространственное смешивание)."""
+class GlobalScaleBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.depthwise = nn.Conv2d(channels, channels, kernel_size=7,
+                                   padding=3, groups=channels)
+        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        r = x
-        x = self.act(self.conv1(x))
-        x = self.conv2(x)
-        return self.act(x + r)
+        residual = x
+        x = self.act(self.depthwise(x))
+        x = self.pointwise(x)
+        x = self.act(x + residual)
+        return x
+
+
+class ModulationBlock(nn.Module):
+    def __init__(self, hint_channels, target_channels):
+        super().__init__()
+        self.gamma_net = nn.Sequential(
+            nn.Conv2d(hint_channels, target_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(target_channels, target_channels, kernel_size=1)
+        )
+        self.beta_net = nn.Sequential(
+            nn.Conv2d(hint_channels, target_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(target_channels, target_channels, kernel_size=1)
+        )
+
+    def forward(self, hint, target):
+        gamma = self.gamma_net(hint)
+        beta = self.beta_net(hint)
+        return target * gamma + beta
 
 
 class ResidualBlock1x1(nn.Module):
-    """Остаточный блок 1x1 – поканальная обработка без учёта соседей."""
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=1)
@@ -36,144 +52,106 @@ class ResidualBlock1x1(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        r = x
+        residual = x
         x = self.act(self.conv1(x))
         x = self.conv2(x)
-        return self.act(x + r)
+        x = self.act(x + residual)
+        return x
 
 
-class ModulatedResBlock(nn.Module):
-    """
-    Остаточный блок с поканальной модуляцией (FiLM).
-    Основная ветвь: две свёртки 3x3.
-    Модуляция: две свёртки 1x1 предсказывают gamma и beta,
-    которые поэлементно управляют выходом основной ветви.
-    Позволяет точно менять каждый пиксель независимо.
-    """
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.act = nn.ReLU(inplace=True)
-
-        # Предсказание gamma и beta
-        self.mod_conv1 = nn.Conv2d(channels, channels * 2, kernel_size=1)
-        self.mod_conv2 = nn.Conv2d(channels * 2, channels * 2, kernel_size=1)
-
-    def forward(self, x):
-        residual = x
-        out = self.act(self.conv1(x))
-        out = self.conv2(out)
-
-        mod = self.act(self.mod_conv1(x))
-        mod = self.mod_conv2(mod)
-        gamma, beta = mod.chunk(2, dim=1)
-
-        out = out * gamma + beta
-        out = self.act(out + residual)
-        return out
-
-
-# --------------------- Компрессор ---------------------
 class ParnetCompressor(nn.Module):
     """
-    Плавное сжатие парнета.
-    Добавлены поканальные блоки 1x1 на начальном и конечном этапах,
-    чтобы компрессор мог анализировать каждый вектор независимо.
+    Парнет [B,3,H,W] -> сжатый парнет [B, compressed_channels, H/2, W/2].
     """
-    def __init__(self, base_dim=64, num_blocks=2, expansion_factor=2, compressed_channels=4):
+    def __init__(self, base_dim=64, num_blocks=4, compressed_channels=4, **kwargs):
         super().__init__()
-        self.high_dim = base_dim * expansion_factor
+        # 1. Поднятие числа каналов без изменения разрешения
+        self.init_conv = nn.Conv2d(3, base_dim, kernel_size=3, padding=1)
 
-        # Этап 0: поканальный анализ (1x1)
-        self.pre_1x1 = nn.Sequential(
-            nn.Conv2d(3, base_dim, kernel_size=1),
-            nn.ReLU(inplace=True),
-            ResidualBlock1x1(base_dim)
+        # 2. StageBlock1: GlobalScaleBlock на полном разрешении
+        self.global_blocks = nn.Sequential(*[
+            GlobalScaleBlock(base_dim) for _ in range(num_blocks)
+        ])
+
+        # 3. Блоки сжатия для global_hint, gamma и beta
+        self.hint_down = nn.Conv2d(base_dim, compressed_channels, kernel_size=3, stride=2, padding=1)
+        self.gamma_down = nn.Conv2d(base_dim, compressed_channels, kernel_size=3, stride=2, padding=1)
+        self.beta_down  = nn.Conv2d(base_dim, compressed_channels, kernel_size=3, stride=2, padding=1)
+
+        # Дополнительный блок для сжатия основного потока: base_dim -> compressed_channels с уменьшением размера
+        self.compress_main = nn.Sequential(
+            nn.AvgPool2d(2),                                    # уменьшает размер вдвое
+            nn.Conv2d(base_dim, compressed_channels, kernel_size=1)
         )
 
-        # Этап 1: вход -> base_dim, пространственная обработка
-        self.init_conv = nn.Conv2d(base_dim, base_dim, 3, padding=1)
-        self.res_blocks_1 = nn.Sequential(*[ResidualBlock(base_dim) for _ in range(num_blocks)])
+        # 4. StageBlock2: модуляция + refine
+        self.mod_block = ModulationBlock(hint_channels=compressed_channels, target_channels=compressed_channels)
+        self.refine_blocks = nn.Sequential(*[
+            ResidualBlock1x1(compressed_channels) for _ in range(num_blocks)
+        ])
 
-        # Этап 2: расширение каналов (1x1)
-        self.expand_channels = nn.Conv2d(base_dim, self.high_dim, 1)
-        self.res_blocks_2 = nn.Sequential(*[ResidualBlock(self.high_dim) for _ in range(num_blocks)])
+    def forward(self, x):
+        x = self.init_conv(x)                        # [B, base_dim, H, W]
+        global_hint = self.global_blocks(x)          # [B, base_dim, H, W]
 
-        # Этап 3: уменьшение разрешения
-        self.down = nn.Conv2d(self.high_dim, self.high_dim, 3, stride=2, padding=1)
-        self.res_blocks_3 = nn.Sequential(*[ResidualBlock(self.high_dim) for _ in range(num_blocks)])
+        # Сжимаем глобальный хинт и получаем gamma/beta
+        hint = self.hint_down(global_hint)           # [B, compressed_channels, H/2, W/2]
+        gamma = self.gamma_down(global_hint)         # [B, compressed_channels, H/2, W/2]
+        beta  = self.beta_down(global_hint)          # [B, compressed_channels, H/2, W/2]
 
-        # Этап 4: поканальная обработка перед финальной проекцией (1x1)
-        self.post_1x1 = nn.Sequential(
-            ResidualBlock1x1(self.high_dim),
-            nn.Conv2d(self.high_dim, self.high_dim, kernel_size=1),
-            nn.ReLU(inplace=True)
-        )
+        # Сжимаем основной поток (base_dim -> compressed_channels + уменьшение разрешения)
+        compressed = self.compress_main(x)           # [B, compressed_channels, H/2, W/2]
 
-        # Финальная проекция
-        self.to_parnet = nn.Conv2d(self.high_dim, compressed_channels, 3, padding=1)
-
-    def forward(self, parnet):
-        # Поканальный анализ
-        x = self.pre_1x1(parnet)
-
-        # Пространственная обработка
-        x = F.relu(self.init_conv(x))
-        x = self.res_blocks_1(x)
-
-        # Расширение каналов и обработка
-        x = F.relu(self.expand_channels(x))
-        x = self.res_blocks_2(x)
-
-        # Сжатие
-        x = F.relu(self.down(x))
-        x = self.res_blocks_3(x)
-
-        # Поканальное уточнение
-        x = self.post_1x1(x)
-
-        # Выход
-        x = self.to_parnet(x)
-        return x
+        # Модуляция с готовыми gamma и beta
+        compressed = compressed * gamma + beta
+        compressed = self.refine_blocks(compressed)
+        return compressed
 
 
-# --------------------- Декомпрессор ---------------------
 class ParnetDecompressor(nn.Module):
     """
-    Плавное разжатие парнета.
-    Обычные ResidualBlock заменены на ModulatedResBlock,
-    чтобы можно было независимо менять каждый пиксель восстанавливаемого парнета.
+    Сжатый парнет [B, compressed_channels, H/2, W/2] -> парнет [B,3,H,W].
     """
-    def __init__(self, base_dim=64, num_blocks=2, expansion_factor=2, compressed_channels=4):
+    def __init__(self, base_dim=64, num_blocks=4, compressed_channels=4, **kwargs):
         super().__init__()
-        self.high_dim = base_dim * expansion_factor
+        # 1. Поднятие числа каналов без изменения разрешения
+        self.init_conv = nn.Conv2d(compressed_channels, base_dim, kernel_size=3, padding=1)
 
-        # Низкое разрешение, high_dim каналов
-        self.init_conv = nn.Conv2d(compressed_channels, self.high_dim, 3, padding=1)
-        self.res_blocks_1 = nn.Sequential(*[ModulatedResBlock(self.high_dim) for _ in range(num_blocks)])
+        # 2. StageBlock1: GlobalScaleBlock на низком разрешении
+        self.global_blocks = nn.Sequential(*[
+            GlobalScaleBlock(base_dim) for _ in range(num_blocks)
+        ])
 
-        # Повышение разрешения
-        self.up = nn.Sequential(
+        # 3. Блоки расширения для global_hint, gamma и beta
+        self.hint_up = nn.ConvTranspose2d(base_dim, 3, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.gamma_up = nn.ConvTranspose2d(base_dim, 3, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.beta_up  = nn.ConvTranspose2d(base_dim, 3, kernel_size=3, stride=2, padding=1, output_padding=1)
+
+        # Дополнительный блок для расширения основного потока: base_dim -> 3 с увеличением размера
+        self.expand_main = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(self.high_dim, self.high_dim, 3, padding=1),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(base_dim, 3, kernel_size=1)
         )
-        self.res_blocks_2 = nn.Sequential(*[ModulatedResBlock(self.high_dim) for _ in range(num_blocks)])
 
-        # Уменьшение каналов
-        self.reduce_channels = nn.Conv2d(self.high_dim, base_dim, 1)
-        self.res_blocks_3 = nn.Sequential(*[ModulatedResBlock(base_dim) for _ in range(num_blocks)])
+        # 4. StageBlock2: модуляция + refine
+        self.mod_block = ModulationBlock(hint_channels=3, target_channels=3)
+        self.refine_blocks = nn.Sequential(*[
+            ResidualBlock1x1(3) for _ in range(num_blocks)
+        ])
 
-        # Финальная проекция
-        self.to_parnet = nn.Conv2d(base_dim, 3, 3, padding=1)
+    def forward(self, x):
+        x = self.init_conv(x)                        # [B, base_dim, H/2, W/2]
+        global_hint = self.global_blocks(x)          # [B, base_dim, H/2, W/2]
 
-    def forward(self, compressed_parnet):
-        x = F.relu(self.init_conv(compressed_parnet))
-        x = self.res_blocks_1(x)
-        x = self.up(x)
-        x = self.res_blocks_2(x)
-        x = F.relu(self.reduce_channels(x))
-        x = self.res_blocks_3(x)
-        x = self.to_parnet(x)
-        return x
+        # Расширяем глобальный хинт и получаем gamma/beta
+        hint = self.hint_up(global_hint)             # [B, 3, H, W]
+        gamma = self.gamma_up(global_hint)           # [B, 3, H, W]
+        beta  = self.beta_up(global_hint)            # [B, 3, H, W]
+
+        # Расширяем основной поток (base_dim -> 3 + увеличение разрешения)
+        parnet = self.expand_main(x)                 # [B, 3, H, W]
+
+        # Модуляция
+        parnet = parnet * gamma + beta
+        parnet = self.refine_blocks(parnet)
+        return parnet

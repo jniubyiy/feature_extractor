@@ -1,25 +1,27 @@
 IMAGE_SIZE = 512
 
 ENCODER_CONFIG = {
-    "base_dim": 64,
-    "num_blocks": 4,
+    "base_dim": 256,
+    "num_blocks": 1,
     "parnet_channels": 3,
-    "dropout_rate": 0.1
+    "dropout_rate": 0.1,
+    "expand_ratio": 2
 }
 DECODER_CONFIG = {
-    "base_dim": 64,
-    "num_blocks": 4,
+    "base_dim": 256,
+    "num_blocks": 1,
     "parnet_channels": 3,
-    "dropout_rate": 0.1
+    "dropout_rate": 0.1,
+    "expand_ratio": 2
 }
 
 ENCODER_DEVICE_STR = "cuda:0"
 DECODER_DEVICE_STR = "cuda:0"
 
-BATCH_SIZE = 2
-LEARNING_RATE = 0.00001
+BATCH_SIZE = 1
+LEARNING_RATE = 0.000001
 NUM_EPOCHS = 100000
-MAX_TRAIN_IMAGES = 427
+MAX_TRAIN_IMAGES = 427 # 427
 DATASET_DIR = "./prepared_dataset"
 MODELS_DIR = "./models"
 TESTS_DIR = "./tests"
@@ -27,21 +29,13 @@ VAL_TESTS_DIR = "./val_tests"
 SAVE_EVERY_EPOCHS = 1
 MAX_CHECKPOINTS = 5
 VALIDATION_SPLIT = 10
-VAL_EVERY_EPOCHS = 1
-TEST_EVERY_EPOCHS = 2
+VAL_EVERY_EPOCHS = 2
+TEST_EVERY_EPOCHS = 1
 NUM_TEST_EXAMPLES = 10
 RANDOM_SEED = 42
 CLEAR_CACHE_EACH_BATCH = True
-DIFF_LOSS_WEIGHT = 1000.0
+DIFF_LOSS_WEIGHT = 100.0
 
 # Потеря гладкости разностного изображения
-DIFF_SMOOTH_LOSS_WEIGHT = 10000.0
-
-# Параметры потери качества парнета (плавность, нормализация, отсутствие выбросов)
-QUALITY_LOSS_WEIGHT = 100.0       # общий коэффициент перед качеством в loss
-
-QUALITY_SMOOTH_WEIGHT = 1.0
-QUALITY_MEAN_WEIGHT = 1.0
-QUALITY_STD_WEIGHT = 1.0
-QUALITY_MAX_WEIGHT = 1.0
-QUALITY_HIST_WEIGHT = 1.0
+DIFF_SMOOTH_LOSS_WEIGHT = 1000.0
+NOISE_STRENGTH = 0.05   # 0.0 – без шума, например 0.05 для небольшого шума

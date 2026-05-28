@@ -7,8 +7,8 @@ DATASET_DIR = "./prepared_dataset_parnet"
 # Папка для сохранения сжатых парнетов
 OUTPUT_DIR = "./prepared_dataset_parnet_compressed"
 # Путь к чекпоинту компрессора (например, "models_compressor/compressor_epoch100.pth")
-COMPRESSOR_CHECKPOINT = "./models_compressor/compressor_epoch47.pth"
+COMPRESSOR_CHECKPOINT = "./models_compressor/compressor_epoch82.pth"
 # Количество параллельных процессов
-NUM_WORKERS = 1
+NUM_WORKERS = 4
 # Устройство для инференса
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
