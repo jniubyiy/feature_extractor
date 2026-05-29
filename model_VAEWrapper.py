@@ -1,192 +1,167 @@
 # model_VAEWrapper.py
 """
-StochasticEncoder и StochasticDecoder без ограничений диапазона.
-Архитектура как у model_Autoencoder, но с SE-блоками для устойчивости к шуму.
-Диапазон значений не ограничен (нет Tanh/clamp).
+StochasticEncoder и StochasticDecoder с фиксированным диапазоном mu (Tanh) и шумом.
+mask_seed из входного сжатого парнета, noise_seed – для конкретной реализации шума.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import zlib
 
-# --------------------- Базовые блоки ---------------------
+# ========== хеш от входного парнета для mask_seed ==========
+def compute_mask_seed(compressed_parnet: torch.Tensor) -> int:
+    with torch.no_grad():
+        data = compressed_parnet.detach().cpu().numpy().tobytes()
+        crc1 = zlib.crc32(data)
+        crc2 = zlib.crc32(data, crc1)
+        return (crc1 << 32) | crc2
 
-class SELayer(nn.Module):
-    """Squeeze-and-Excitation: перекалибровка каналов для подавления шума."""
-    def __init__(self, channels, reduction=4):
+# ---------- Перестановочный слой ----------
+class PermutationMask(nn.Module):
+    def __init__(self, channels, height, width, seed):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
+        total = channels * height * width
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        perm = torch.randperm(total, generator=generator)
+        inv_perm = torch.argsort(perm)
+        self.register_buffer('perm', perm)
+        self.register_buffer('inv_perm', inv_perm)
+        self.channels = channels
+        self.height = height
+        self.width = width
+
+    def forward(self, x):
+        B = x.size(0)
+        x_flat = x.view(B, -1)
+        return x_flat[:, self.perm].view(B, self.channels, self.height, self.width)
+
+    def inverse(self, x):
+        B = x.size(0)
+        x_flat = x.view(B, -1)
+        return x_flat[:, self.inv_perm].view(B, self.channels, self.height, self.width)
+
+
+# ---------- Базовые блоки ----------
+class GlobalContextScaleBlock(nn.Module):
+    def __init__(self, channels, expand_ratio=2, reduction=4):
+        super().__init__()
+        hidden = channels * expand_ratio
+        self.expand = nn.Conv2d(channels, hidden, kernel_size=1)
+        self.depthwise = nn.Conv2d(hidden, hidden, kernel_size=7, padding=3, groups=hidden)
+        self.compress = nn.Conv2d(hidden, channels, kernel_size=1)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.se_fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1)
+        self.se_fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1)
+        self.act = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        residual = x
+        out = self.act(self.expand(x))
+        out = self.act(self.depthwise(out))
+        out = self.compress(out)
+        se = self.global_pool(out)
+        se = self.act(self.se_fc1(se))
+        se = self.sigmoid(self.se_fc2(se))
+        out = out * se + residual
+        return self.act(out)
+
+
+class DynamicContextResidualBlock(nn.Module):
+    def __init__(self, x_channels, ctx_channels, reduction=4):
+        super().__init__()
+        self.weight_generator = nn.Sequential(
+            nn.Conv2d(ctx_channels, ctx_channels // reduction, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(ctx_channels // reduction, x_channels * x_channels, kernel_size=1)
+        )
+        self.bias_generator = nn.Sequential(
+            nn.Conv2d(ctx_channels, ctx_channels // reduction, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(ctx_channels // reduction, x_channels, kernel_size=1)
+        )
+
+    def forward(self, x, ctx):
+        B, C, H, W = x.shape
+        weight_raw = self.weight_generator(ctx)
+        weight_mat = weight_raw.view(B, C, C, H, W).permute(0, 3, 4, 1, 2)
+        bias_raw = self.bias_generator(ctx)
+        bias = bias_raw.permute(0, 2, 3, 1)
+        x_perm = x.permute(0, 2, 3, 1)
+        delta = torch.einsum('bhwij,bhwj->bhwi', weight_mat, x_perm) + bias
+        delta = delta.permute(0, 3, 1, 2)
+        return x + delta
+
+
+class StochasticGlobalContextBlock(GlobalContextScaleBlock):
+    def __init__(self, channels, expand_ratio=2):
+        super().__init__(channels, expand_ratio, reduction=2)
+
+
+class StochasticDynamicContextResidualBlock(nn.Module):
+    def __init__(self, x_channels, ctx_channels, reduction=4):
+        super().__init__()
+        self.core = DynamicContextResidualBlock(x_channels, ctx_channels, reduction)
+        self.delta_se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(x_channels, x_channels // reduction, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(x_channels // reduction, x_channels, kernel_size=1),
             nn.Sigmoid()
         )
 
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y
-
-
-class GlobalScaleBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.depthwise = nn.Conv2d(channels, channels, kernel_size=7,
-                                   padding=3, groups=channels)
-        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        residual = x
-        x = self.act(self.depthwise(x))
-        x = self.pointwise(x)
-        x = self.act(x + residual)
-        return x
-
-
-class ModulationBlock(nn.Module):
-    def __init__(self, hint_channels, target_channels):
-        super().__init__()
-        self.gamma_net = nn.Sequential(
-            nn.Conv2d(hint_channels, target_channels, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(target_channels, target_channels, kernel_size=1)
-        )
-        self.beta_net = nn.Sequential(
-            nn.Conv2d(hint_channels, target_channels, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(target_channels, target_channels, kernel_size=1)
-        )
-
-    def forward(self, hint, target):
-        gamma = self.gamma_net(hint)
-        beta = self.beta_net(hint)
-        return target * gamma + beta
-
-
-class ResidualBlock1x1(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=1)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=1)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        residual = x
-        x = self.act(self.conv1(x))
-        x = self.conv2(x)
-        x = self.act(x + residual)
-        return x
-
-
-# ---------- Специализированные блоки для VAE ----------
-
-class EncoderGlobalScaleBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.block = GlobalScaleBlock(channels)
-        self.se = SELayer(channels)
-
-    def forward(self, x):
-        x = self.block(x)
-        x = self.se(x)
-        return x
-
-
-class DecoderGlobalScaleBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.block = GlobalScaleBlock(channels)
-        self.se = SELayer(channels)
-
-    def forward(self, x):
-        x = self.block(x)
-        x = self.se(x)
-        return x
-
-
-class EncoderModulationBlock(nn.Module):
-    def __init__(self, hint_channels, target_channels):
-        super().__init__()
-        self.mod = ModulationBlock(hint_channels, target_channels)
-        self.se = SELayer(target_channels)
-
-    def forward(self, hint, target):
-        out = self.mod(hint, target)
-        out = self.se(out)
-        return out
-
-
-class DecoderModulationBlock(nn.Module):
-    def __init__(self, hint_channels, target_channels):
-        super().__init__()
-        self.mod = ModulationBlock(hint_channels, target_channels)
-        self.se = SELayer(target_channels)
-
-    def forward(self, hint, target):
-        out = self.mod(hint, target)
-        out = self.se(out)
-        return out
-
-
-class EncoderResidualBlock1x1(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.res = ResidualBlock1x1(channels)
-        self.se = SELayer(channels)
-
-    def forward(self, x):
-        x = self.res(x)
-        x = self.se(x)
-        return x
-
-
-class DecoderResidualBlock1x1(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.res = ResidualBlock1x1(channels)
-        self.se = SELayer(channels)
-
-    def forward(self, x):
-        x = self.res(x)
-        x = self.se(x)
-        return x
+    def forward(self, x, ctx):
+        delta = self.core(x, ctx) - x
+        scale = self.delta_se(delta)
+        delta = delta * scale
+        return x + delta
 
 
 # ---------- Основные модели ----------
-
 class StochasticEncoder(nn.Module):
     def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
-                 hidden_dim=128, num_res_blocks=4, **kwargs):
+                 hidden_dim=128, num_res_blocks=4, H=256, W=256, **kwargs):
         super().__init__()
-        num_blocks = num_res_blocks
-
+        self.H = H
+        self.W = W
+        self.stochastic_parnet_dim = stochastic_parnet_dim
         self.init_conv = nn.Conv2d(compressed_channels, hidden_dim, kernel_size=3, padding=1)
         self.global_blocks = nn.Sequential(*[
-            EncoderGlobalScaleBlock(hidden_dim) for _ in range(num_blocks)
+            StochasticGlobalContextBlock(hidden_dim) for _ in range(num_res_blocks)
         ])
         self.compress = nn.Conv2d(hidden_dim, stochastic_parnet_dim, kernel_size=3, padding=1)
-        self.mod_block = EncoderModulationBlock(hidden_dim, stochastic_parnet_dim)
-        self.refine_blocks = nn.Sequential(*[
-            EncoderResidualBlock1x1(stochastic_parnet_dim) for _ in range(num_blocks)
-        ])
+        self.dynamic_refine = StochasticDynamicContextResidualBlock(stochastic_parnet_dim, hidden_dim)
+        self.tanh = nn.Tanh()   # mu в [-1, 1]
 
     def forward(self, x):
+        self.input_parnet = x.detach().clone()
         x = self.init_conv(x)
-        global_hint = self.global_blocks(x)
-        parnet = self.compress(x)
-        parnet = self.mod_block(global_hint, parnet)
-        parnet = self.refine_blocks(parnet)
-        mu = parnet                                    # БЕЗ Tanh
+        ctx = self.global_blocks(x)
+        parnet = self.compress(ctx)
+        mu_raw = self.dynamic_refine(parnet, ctx)
+        mu = self.tanh(mu_raw)   # ограничиваем диапазон
         return mu
 
     def reparameterize(self, mu, strength=1.0):
-        noise = torch.empty_like(mu).uniform_(-1.0, 1.0)
-        z = mu + noise * strength                       # БЕЗ clamp
-        return z
+        """
+        Возвращает (z, noise_seed, mask_seed).
+        Шум равномерный в [-strength, strength].
+        """
+        mask_seed = compute_mask_seed(self.input_parnet)
+        noise_seed = torch.randint(0, 2**31-1, (1,)).item()
+
+        gen = torch.Generator(device=mu.device).manual_seed(noise_seed)
+        noise = (torch.rand_like(mu, generator=gen) * 2 - 1) * strength
+        z_raw = mu + noise
+
+        perm_mask = PermutationMask(mu.size(1), mu.size(2), mu.size(3), mask_seed)
+        z = perm_mask(z_raw)
+        return z, noise_seed, mask_seed
 
     def kl_divergence(self, mu):
+        # KL для ограниченного mu можно вычислять как обычно, но теперь mu не распределён как N(0,1)
+        # Оставляем стандартную форму, она всё ещё будет работать как регуляризатор.
         return 0.5 * torch.sum(mu.pow(2))
 
 
@@ -194,39 +169,33 @@ class StochasticDecoder(nn.Module):
     def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
                  hidden_dim=128, num_res_blocks=6, **kwargs):
         super().__init__()
-        num_blocks = num_res_blocks
-
         self.expand = nn.Conv2d(stochastic_parnet_dim, hidden_dim, kernel_size=3, padding=1)
         self.global_blocks = nn.Sequential(*[
-            DecoderGlobalScaleBlock(hidden_dim) for _ in range(num_blocks)
+            StochasticGlobalContextBlock(hidden_dim) for _ in range(num_res_blocks)
         ])
         self.compress = nn.Conv2d(hidden_dim, compressed_channels, kernel_size=3, padding=1)
-        self.mod_block = DecoderModulationBlock(hidden_dim, compressed_channels)
-        self.refine_blocks = nn.Sequential(*[
-            DecoderResidualBlock1x1(compressed_channels) for _ in range(num_blocks)
-        ])
+        self.dynamic_refine = StochasticDynamicContextResidualBlock(compressed_channels, hidden_dim)
 
-    def forward(self, z):
-        x = self.expand(z)
-        global_hint = self.global_blocks(x)
-        mid = self.compress(x)
-        mid = self.mod_block(global_hint, mid)
-        mid = self.refine_blocks(mid)
-        out = mid                                       # БЕЗ Tanh
+    def forward(self, z, mask_seed: int):
+        B, C, H, W = z.shape
+        perm_mask = PermutationMask(C, H, W, mask_seed)
+        z_restored = perm_mask.inverse(z)
+        x = self.expand(z_restored)
+        ctx = self.global_blocks(x)
+        mid = self.compress(ctx)
+        out = self.dynamic_refine(mid, ctx)
         return out
 
 
 class VAEWrapper(nn.Module):
     def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
-                 hidden_dim=128, **kwargs):
+                 hidden_dim=128, H=256, W=256, **kwargs):
         super().__init__()
         self.encoder = StochasticEncoder(compressed_channels, stochastic_parnet_dim,
-                                         hidden_dim, **kwargs)
+                                         hidden_dim, H=H, W=W, **kwargs)
         self.decoder = StochasticDecoder(compressed_channels, stochastic_parnet_dim,
                                          hidden_dim, **kwargs)
 
     def forward(self, x):
         mu = self.encoder(x)
-        z = mu
-        out = self.decoder(z)
-        return out
+        return mu
