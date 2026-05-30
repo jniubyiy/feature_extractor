@@ -37,14 +37,16 @@ STOCHASTIC_DECODER_CONFIG = {
 }
 
 # ========================= Пути и имена директорий =========================
-DATASET_DIR = "./prepared_dataset_parnet_compressed"   # сжатые парнеты
+DATASET_DIR = "./prepared_dataset_structured_parnet"   # сжатые парнеты
 MODELS_DIR = "./models_vae_wrapper"                    # чекпоинты моделей
 TESTS_DIR = "./tests_vae_wrapper"                      # визуализации на train
 VAL_TESTS_DIR = "./val_tests_vae_wrapper"              # визуализации на val
 
 # Пути к замороженным моделям (только для визуализации)
+AE_CHECKPOINT = "./models_parnet_ae/*****_epoch46.pth"
 DECOMPRESSOR_CHECKPOINT = "./models_compressor/decompressor_epoch82.pth"
 DECODER_CHECKPOINT = "./models/decoder_epoch46.pth"
+
 
 # ========================= Параметры обучения =========================
 BATCH_SIZE = 6

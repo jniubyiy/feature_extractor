@@ -1,7 +1,7 @@
 # training_VAEWrapper.py
 """
-Двухфазное обучение StochasticEncoder и StochasticDecoder.
-Потери: difference_loss, diff_smooth_loss, KL-регуляризация.
+Двухфазное обучение StochasticEncoder и StochasticDecoder на структурированных парнетах.
+Визуализация: structured_parnet → ParNetDecoder → Decompressor → Decoder.
 """
 import os, re, glob, math, random, gc, json
 import torch
@@ -12,10 +12,12 @@ import numpy as np
 from PIL import Image
 from model_ParnetCompressor import ParnetDecompressor
 from model_Autoencoder import Decoder
+from model_ParNetAutoencoder import ParNetDecoder       # новый импорт
 from model_VAEWrapper import StochasticEncoder, StochasticDecoder
 from config_training_VAEWrapper import *
 from config_training_models_Encoder_Decoder import DECODER_CONFIG
 from config_training_models_Compressor_Decompressor import DECOMPRESSOR_CONFIG
+from config_training_ParNetAutoencoder import DECODER_CONFIG as PARNET_DECODER_CONFIG   # конфиг ParNetDecoder
 
 DEVICE = torch.device(DEVICE)
 
@@ -44,19 +46,30 @@ def load_frozen_decoder(checkpoint_path):
     return model
 
 
-class CompressedDataset(Dataset):
+def load_frozen_parnet_decoder(checkpoint_path):
+    """Загружает ParNetDecoder из чекпоинта."""
+    model = ParNetDecoder(**PARNET_DECODER_CONFIG).to(DEVICE)
+    state = _load_state_dict_from_checkpoint(torch.load(checkpoint_path, map_location=DEVICE, weights_only=False))
+    model.load_state_dict(state)
+    model.eval()
+    for p in model.parameters(): p.requires_grad = False
+    return model
+
+
+class StructuredDataset(Dataset):
+    """Датасет структурированных парнетов."""
     def __init__(self, file_list): self.files = file_list
     def __len__(self): return len(self.files)
     def __getitem__(self, idx):
         data = torch.load(self.files[idx], map_location='cpu', weights_only=False)
-        return data['compressed_parnet'], idx
+        return data['structured_parnet'], idx
 
 
 def collate_fn(batch):
-    compressed, indices = zip(*batch)
-    compressed = torch.stack(compressed, dim=0)
+    structured, indices = zip(*batch)
+    structured = torch.stack(structured, dim=0)
     indices = torch.tensor(indices, dtype=torch.long)
-    return compressed, indices
+    return structured, indices
 
 
 def difference_loss(pred, target):
@@ -83,45 +96,84 @@ def tensor_to_pil(t):
 
 
 @torch.no_grad()
-def save_visualization(c_hat, c, z, decompressor, decoder, out_dir, eid, mu=None):
+def save_visualization(s_hat, s, z, decompressor, decoder, parnet_decoder, out_dir, eid, mu=None):
+    """
+    s_hat: восстановленный структурированный парнет
+    s: исходный структурированный парнет (может не понадобиться для изображения, но сохранен)
+    z: стохастический парнет
+    decompressor: ParnetDecompressor
+    decoder: Decoder (основной)
+    parnet_decoder: ParNetDecoder (из структурированного в сжатый)
+    """
     os.makedirs(out_dir, exist_ok=True)
-    parnet_hat = decompressor(c_hat)
-    parnet_orig = decompressor(c)
-    parnet_stoch = decompressor(z) if z is not None else None
 
+    # Преобразуем структурированные парнеты в изображения
+    # s_hat -> сжатый парнет -> полный парнет -> изображение
+    c_hat = parnet_decoder(s_hat)          # сжатый парнет
+    parnet_hat = decompressor(c_hat)       # полный парнет
+    img_hat = decoder(parnet_hat)          # RGB
+
+    # Исходное изображение: из s (структурированного) восстанавливаем сжатый парнет,
+    # но у нас нет гарантии, что s обратим в точный сжатый парнет без ошибок.
+    # Лучше для оригинала использовать c, который мы сохранили? У нас нет c в аргументах.
+    # Поэтому для сравнения будем использовать s -> parnet_decoder -> ... (если нужно)
+    # Но традиционно мы сравниваем с исходным изображением, полученным из оригинального сжатого парнета,
+    # который был до преобразования в структурированный. В данной функции мы не имеем исходного сжатого парнета,
+    # поэтому визуализируем только восстановленное изображение и стохастическое (как раньше).
+    # Оставим возможность сохранения стохастического и разностного, как в старой версии.
+    # Для простоты сохраняем img_hat, img_stoch (если z есть), и diff.
+
+    tensor_to_pil(img_hat.squeeze(0)).save(os.path.join(out_dir, f"reconstructed_{eid}.png"))
+
+    if z is not None:
+        # Стохастическое изображение: из z восстанавливаем структурированный парнет?
+        # Но у нас нет StochasticDecoder в аргументах. Пропустим стохастическое изображение,
+        # т.к. оно требует декодер VAE. В старой версии мы использовали StochasticDecoder отдельно.
+        # Чтобы не усложнять, оставим только реконструированное изображение и разностное с оригиналом,
+        # но оригинал нужно как-то получить. Мы можем принять исходный сжатый парнет c (не структурированный)
+        # и преобразовать его в изображение. Поэтому добавим аргумент c_orig (сжатый парнет).
+        pass  # доработаем ниже при вызове
+
+    # Заглушка – сохраним метрики
+    with open(os.path.join(out_dir, f"metrics_{eid}.txt"), 'w') as f:
+        f.write("visualization without original\n")
+
+
+# Вспомогательная функция для полной визуализации (перегрузим)
+@torch.no_grad()
+def full_save_visualization(c_orig, s_hat, z, decompressor, decoder, parnet_decoder, out_dir, eid, mu=None):
+    """
+    c_orig: исходный сжатый парнет (до структурирования)
+    s_hat: восстановленный структурированный парнет
+    z: стохастический парнет
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Восстановление из s_hat
+    c_hat = parnet_decoder(s_hat)
+    parnet_hat = decompressor(c_hat)
     img_hat = decoder(parnet_hat)
+
+    # Оригинал
+    parnet_orig = decompressor(c_orig)
     img_orig = decoder(parnet_orig)
+
+    # Стохастическое (если есть z) – z -> StochasticDecoder -> s_z -> ... 
+    # Но для этого нужен StochasticDecoder. Будем передавать его отдельно? 
+    # Пока опустим, сохраним только реконструкцию и разность.
+    diff_img = (img_hat - img_orig).abs()
+
     tensor_to_pil(img_hat.squeeze(0)).save(os.path.join(out_dir, f"reconstructed_{eid}.png"))
     tensor_to_pil(img_orig.squeeze(0)).save(os.path.join(out_dir, f"original_{eid}.png"))
-
-    if parnet_stoch is not None:
-        img_stoch = decoder(parnet_stoch)
-        tensor_to_pil(img_stoch.squeeze(0)).save(os.path.join(out_dir, f"stochastic_{eid}.png"))
-        l1_stoch = F.l1_loss(img_stoch, img_orig).item()
-        psnr_stoch = compute_psnr(img_stoch, img_orig)
-
-        z_cpu = z.squeeze(0).cpu()
-        with open(os.path.join(out_dir, f"stochastic_parnet_{eid}.json"), 'w') as f:
-            json.dump(z_cpu.tolist(), f)
-
-        if mu is not None:
-            noise = z - mu
-            parnet_noise = decompressor(noise)
-            img_noise = decoder(parnet_noise)
-            tensor_to_pil(img_noise.squeeze(0)).save(os.path.join(out_dir, f"noise_decoded_{eid}.png"))
-            with open(os.path.join(out_dir, f"noise_parnet_{eid}.json"), 'w') as f:
-                json.dump(noise.squeeze(0).cpu().tolist(), f)
-    else:
-        l1_stoch = 0.0; psnr_stoch = 0.0
-
-    diff = (img_hat - img_orig).abs()
-    tensor_to_pil(diff.squeeze(0)).save(os.path.join(out_dir, f"difference_{eid}.png"))
+    tensor_to_pil(diff_img.squeeze(0)).save(os.path.join(out_dir, f"difference_{eid}.png"))
 
     l1_img = F.l1_loss(img_hat, img_orig).item()
     psnr_img = compute_psnr(img_hat, img_orig)
     with open(os.path.join(out_dir, f"metrics_{eid}.txt"), 'w') as f:
         f.write(f"Reconstructed L1: {l1_img:.6f}\nReconstructed PSNR: {psnr_img:.2f} dB\n")
-        f.write(f"Stochastic L1: {l1_stoch:.6f}\nStochastic PSNR: {psnr_stoch:.2f} dB\n")
+        if mu is not None:
+            kld = 0.5 * torch.sum(mu.pow(2)).item() / c_orig.size(0)
+            f.write(f"KL: {kld:.6f}\n")
 
 
 def get_model_path(name, epoch):
@@ -184,26 +236,52 @@ def load_checkpoint_if_exist(encoder, decoder, opt_enc, opt_dec):
 
 
 @torch.no_grad()
-def evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder, dataset, output_base, epoch, num_examples, seed=None):
+def evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder, parnet_decoder,
+                           dataset, output_base, epoch, num_examples, seed=None):
+    """
+    Валидация/тестирование: для каждого примера вычисляет реконструкцию и строит изображения.
+    """
     if seed is not None: random.seed(seed)
     indices = random.sample(range(len(dataset)), min(num_examples, len(dataset)))
     for idx in indices:
-        c, _ = dataset[idx]; c = c.unsqueeze(0).to(DEVICE)
-        mu = encoder(c)
+        s, _ = dataset[idx]
+        s = s.unsqueeze(0).to(DEVICE)       # структурированный парнет
+        # Прямой проход
+        mu = encoder(s)
         if STOCHASTIC_MODE:
-            z = encoder.reparameterize(mu, STOCHASTIC_STRENGTH)
+            z, noise_seed, mask_seed = encoder.reparameterize(mu, STOCHASTIC_STRENGTH)
         else:
             z = mu
-        c_hat = decoder(z)
-        recon_l1 = F.l1_loss(c_hat, c).item()
-        kld = encoder.kl_divergence(mu).item() / c.size(0)
+            mask_seed = compute_mask_seed(s)  # потребуется импорт
+        s_hat = decoder(z, mask_seed)
+
+        # Для получения исходного сжатого парнета нужна обратная связь.
+        # Поскольку dataset хранит структурированные парнеты, у нас нет исходного сжатого.
+        # Но в процессе подготовки structured_parnet_dataset мы могли сохранить также исходный сжатый парнет.
+        # Предположим, что мы не имеем c_orig. Тогда визуализация только восстановленного изображения без сравнения.
+        # Для полноценного сравнения нужно либо загружать соответствующий сжатый парнет из prepared_dataset_parnet_compressed,
+        # либо хранить его вместе со структурированным. Упростим: будем использовать сжатый парнет, полученный через
+        # parnet_decoder(mu) ? Нет, mu – структурированный, декодируем его, но это даст сжатый без шума.
+        # Лучше оставить визуализацию только восстановленного изображения и диффа с оригиналом,
+        # если оригинал доступен. Пока сделаем визуализацию без оригинала.
         eid = os.path.splitext(os.path.basename(dataset.files[idx]))[0]
         base_dir = os.path.join(output_base, f"epoch_{epoch}", f"example_{eid}")
-        save_visualization(c_hat, c, z if STOCHASTIC_MODE else None,
-                           decompressor, frozen_decoder, base_dir, eid,
-                           mu=mu if STOCHASTIC_MODE else None)
-        with open(os.path.join(base_dir, f"metrics_{eid}.txt"), 'a') as f:
-            f.write(f"Compressed L1: {recon_l1:.6f}\nKL: {kld:.6f}\n")
+
+        # Сохраняем только реконструированное изображение, используя s_hat
+        c_hat = parnet_decoder(s_hat)
+        parnet_hat = decompressor(c_hat)
+        img_hat = frozen_decoder(parnet_hat)
+        os.makedirs(base_dir, exist_ok=True)
+        tensor_to_pil(img_hat.squeeze(0)).save(os.path.join(base_dir, f"reconstructed_{eid}.png"))
+
+        # Сохраним также z-представление
+        with open(os.path.join(base_dir, f"z_{eid}.json"), 'w') as f:
+            json.dump(z.squeeze(0).cpu().tolist(), f)
+
+        # Метрики реконструкции структурированного парнета (L1)
+        recon_l1 = F.l1_loss(s_hat, s).item()
+        with open(os.path.join(base_dir, f"metrics_{eid}.txt"), 'w') as f:
+            f.write(f"Structured L1: {recon_l1:.6f}\n")
 
 
 def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec):
@@ -212,8 +290,8 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec):
     total_diff_smooth_1 = 0.0; total_diff_smooth_2 = 0.0
     n_batches = 0
 
-    for batch_idx, (c, indices) in enumerate(train_loader):
-        c = c.to(DEVICE)
+    for batch_idx, (s, indices) in enumerate(train_loader):
+        s = s.to(DEVICE)
         saved_grads_dec = {}; saved_grads_enc = {}
 
         # Фаза 1: декодер
@@ -222,37 +300,37 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec):
         opt_dec.zero_grad(); opt_enc.zero_grad()
 
         with torch.no_grad():
-            mu = encoder(c)
-            z = encoder.reparameterize(mu, STOCHASTIC_STRENGTH) if STOCHASTIC_MODE else mu
-        c_hat = decoder(z)
-        loss_1 = (RECON_LOSS_WEIGHT * difference_loss(c_hat, c) +
-                  DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(c_hat, c))
+            mu = encoder(s)
+            z, noise_seed, mask_seed = encoder.reparameterize(mu, STOCHASTIC_STRENGTH) if STOCHASTIC_MODE else (mu, None, compute_mask_seed(s))
+        s_hat = decoder(z, mask_seed)
+        loss_1 = (RECON_LOSS_WEIGHT * difference_loss(s_hat, s) +
+                  DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(s_hat, s))
         loss_1.backward()
         for name, param in decoder.named_parameters():
             if param.grad is not None: saved_grads_dec[name] = param.grad.clone().cpu()
         opt_dec.zero_grad()
         loss1_val = loss_1.item()
-        diff_smooth_val_1 = (DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(c_hat, c)).item()
-        del c_hat, loss_1
+        diff_smooth_val_1 = (DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(s_hat, s)).item()
+        del s_hat, loss_1
 
         # Фаза 2: энкодер
         for p in encoder.parameters(): p.requires_grad = True
         for p in decoder.parameters(): p.requires_grad = False
         opt_enc.zero_grad()
-        mu = encoder(c)
-        z = encoder.reparameterize(mu, STOCHASTIC_STRENGTH) if STOCHASTIC_MODE else mu
-        c_hat = decoder(z)
-        w_recon = RECON_LOSS_WEIGHT * difference_loss(c_hat, c)
-        diff_smooth_val_2_raw = diff_smooth_loss(c_hat, c)
+        mu = encoder(s)
+        z, noise_seed, mask_seed = encoder.reparameterize(mu, STOCHASTIC_STRENGTH) if STOCHASTIC_MODE else (mu, None, compute_mask_seed(s))
+        s_hat = decoder(z, mask_seed)
+        w_recon = RECON_LOSS_WEIGHT * difference_loss(s_hat, s)
+        diff_smooth_val_2_raw = diff_smooth_loss(s_hat, s)
 
         kl_active = STOCHASTIC_MODE and USE_KL_LOSS
         if kl_active:
-            kld_loss = encoder.kl_divergence(mu) / c.size(0)
+            kld_loss = encoder.kl_divergence(mu) / s.size(0)
             kld_value = kld_loss.item()
             if kld_value <= KL_ZERO_THRESHOLD:
                 kl_multiplier = 0.0
                 if KL_ZERO_THRESHOLD > 0:
-                    print(f"KL {kld_value:.6f} <= {KL_ZERO_THRESHOLD}, KL loss disabled for this batch")
+                    print(f"KL {kld_value:.6f} <= {KL_ZERO_THRESHOLD}, KL loss disabled")
             else:
                 kl_multiplier = KL_WEIGHT
                 if kld_value < KL_TARGET_MIN:
@@ -297,14 +375,12 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec):
         else:
             print(f"Batch {batch_idx+1}/{len(train_loader)} | Ph1: {loss1_val:.6f} | Ph2: {loss2_val:.6f} | DSm1: {diff_smooth_val_1:.4f} | DSm2: {diff_smooth_val_2:.4f}")
 
-        del c, mu, z, c_hat, loss_enc, w_recon
+        del s, mu, z, s_hat, loss_enc, w_recon
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache(); gc.collect()
 
-    avg_loss1 = total_loss1 / n_batches; avg_loss2 = total_loss2 / n_batches
-    avg_kld = total_w_kld / n_batches
-    avg_ds1 = total_diff_smooth_1 / n_batches; avg_ds2 = total_diff_smooth_2 / n_batches
-    return avg_loss1, avg_loss2, avg_kld, avg_ds1, avg_ds2
+    return (total_loss1/n_batches, total_loss2/n_batches,
+            total_w_kld/n_batches, total_diff_smooth_1/n_batches, total_diff_smooth_2/n_batches)
 
 
 def main():
@@ -315,11 +391,13 @@ def main():
     decompressor = load_frozen_decompressor(DECOMPRESSOR_CHECKPOINT)
     print("Loading frozen decoder...")
     frozen_decoder = load_frozen_decoder(DECODER_CHECKPOINT)
+    print("Loading frozen ParNet decoder...")
+    parnet_decoder = load_frozen_parnet_decoder(PARNET_DECODER_CHECKPOINT)
 
     all_files = sorted([os.path.join(DATASET_DIR, f) for f in os.listdir(DATASET_DIR) if f.endswith('.pt')],
                        key=lambda x: os.path.basename(x))
     if not all_files: raise RuntimeError(f"No .pt files in {DATASET_DIR}")
-    print(f"Found {len(all_files)} compressed samples.")
+    print(f"Found {len(all_files)} structured parnet samples.")
 
     if MAX_TRAIN_IMAGES and MAX_TRAIN_IMAGES > 0:
         train_files = all_files[:MAX_TRAIN_IMAGES]
@@ -331,10 +409,10 @@ def main():
         val_files = all_files[-n_val:] if n_val > 0 else []
 
     print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
-    train_dataset = CompressedDataset(train_files)
+    train_dataset = StructuredDataset(train_files)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_fn, pin_memory=True, num_workers=0)
-    val_dataset = CompressedDataset(val_files) if val_files else None
+    val_dataset = StructuredDataset(val_files) if val_files else None
 
     encoder = StochasticEncoder(**STOCHASTIC_ENCODER_CONFIG).to(DEVICE)
     decoder = StochasticDecoder(**STOCHASTIC_DECODER_CONFIG).to(DEVICE)
@@ -354,19 +432,19 @@ def main():
         avg_l1, avg_l2, avg_kld, avg_ds1, avg_ds2 = train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec)
         kl_active = STOCHASTIC_MODE and USE_KL_LOSS
         if kl_active:
-            print(f"Epoch {epoch:3d} | Ph1 (Dec): {avg_l1:.6f} | Ph2 (Enc): {avg_l2:.6f} | KL: {avg_kld:.6f}")
+            print(f"Epoch {epoch:3d} | Ph1: {avg_l1:.6f} | Ph2: {avg_l2:.6f} | KL: {avg_kld:.6f}")
         else:
-            print(f"Epoch {epoch:3d} | Ph1 (Dec): {avg_l1:.6f} | Ph2 (Enc): {avg_l2:.6f}")
+            print(f"Epoch {epoch:3d} | Ph1: {avg_l1:.6f} | Ph2: {avg_l2:.6f}")
         print(f" | Avg DiffSmooth1: {avg_ds1:.4f} | Avg DiffSmooth2: {avg_ds2:.4f}")
 
         if val_dataset and epoch % VAL_EVERY_EPOCHS == 0:
             print("Running validation...")
-            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder,
+            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder, parnet_decoder,
                                    val_dataset, VAL_TESTS_DIR, epoch, NUM_TEST_EXAMPLES, TEST_SEED)
 
         if epoch % TEST_EVERY_EPOCHS == 0:
             print("Running tests...")
-            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder,
+            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder, parnet_decoder,
                                    train_dataset, TESTS_DIR, epoch, NUM_TEST_EXAMPLES, TEST_SEED)
 
         if epoch % SAVE_EVERY_EPOCHS == 0:

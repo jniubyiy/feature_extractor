@@ -7,7 +7,7 @@ DATASET_DIR = "./prepared_dataset_parnet"
 # Папка для сохранения сжатых парнетов
 OUTPUT_DIR = "./prepared_dataset_parnet_compressed"
 # Путь к чекпоинту компрессора (например, "models_compressor/compressor_epoch100.pth")
-COMPRESSOR_CHECKPOINT = "./models_compressor/compressor_epoch82.pth"
+COMPRESSOR_CHECKPOINT = "./models_compressor/compressor_epoch85.pth"
 # Количество параллельных процессов
 NUM_WORKERS = 4
 # Устройство для инференса
