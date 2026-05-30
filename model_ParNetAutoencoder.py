@@ -1,12 +1,10 @@
 # model_ParNetAutoencoder.py
 """
-ParNetAutoencoder: автоэнкодер для сжатых парнетов (compressed parnet).
-Энкодер сжимает до bottleneck_channels с Tanh на выходе (диапазон [-1,1]).
-Декодер восстанавливает исходный сжатый парнет.
+ParNetAutoencoder: автоэнкодер для сжатых парнетов.
+Промежуточное представление – структурированный парнет (structured parnet) в [-1,1].
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from model_Autoencoder import GlobalContextScaleBlock, DynamicContextResidualBlock
 
 class ParNetEncoder(nn.Module):
@@ -17,14 +15,14 @@ class ParNetEncoder(nn.Module):
             GlobalContextScaleBlock(base_dim) for _ in range(num_blocks)
         ])
         self.compress = nn.Conv2d(base_dim, bottleneck_channels, kernel_size=3, padding=1)
-        self.output_activation = nn.Tanh()   # гарантирует [-1,1]
+        self.tanh = nn.Tanh()
 
-    def forward(self, x):
-        x = self.init_conv(x)
+    def forward(self, compressed_parnet):
+        x = self.init_conv(compressed_parnet)
         ctx = self.global_blocks(x)
-        bottleneck = self.compress(ctx)
-        bottleneck = self.output_activation(bottleneck)
-        return bottleneck
+        structured_parnet = self.compress(ctx)
+        structured_parnet = self.tanh(structured_parnet)
+        return structured_parnet
 
 class ParNetDecoder(nn.Module):
     def __init__(self, bottleneck_channels=4, output_channels=4, base_dim=128, num_blocks=2):
@@ -36,20 +34,21 @@ class ParNetDecoder(nn.Module):
         self.compress = nn.Conv2d(base_dim, output_channels, kernel_size=3, padding=1)
         self.dynamic_refine = DynamicContextResidualBlock(output_channels, base_dim)
 
-    def forward(self, x):
-        x = self.expand(x)
+    def forward(self, structured_parnet):
+        x = self.expand(structured_parnet)
         ctx = self.global_blocks(x)
         out = self.compress(ctx)
         out = self.dynamic_refine(out, ctx)
         return out
 
 class ParNetAutoencoder(nn.Module):
-    def __init__(self, input_channels=4, bottleneck_channels=4, base_dim=128, num_blocks=2):
+    def __init__(self, input_channels=4, bottleneck_channels=4, base_dim=128, num_blocks=2,
+                 **kwargs):  # **kwargs для совместимости с разными конфигами
         super().__init__()
         self.encoder = ParNetEncoder(input_channels, bottleneck_channels, base_dim, num_blocks)
         self.decoder = ParNetDecoder(bottleneck_channels, input_channels, base_dim, num_blocks)
 
     def forward(self, x):
-        latent = self.encoder(x)
-        recon = self.decoder(latent)
-        return recon
+        structured_parnet = self.encoder(x)
+        reconstructed = self.decoder(structured_parnet)
+        return reconstructed

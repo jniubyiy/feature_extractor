@@ -1,9 +1,8 @@
 # config_training_ParNetAutoencoder.py
-"""Конфигурация обучения ParNetAutoencoder."""
+"""Конфигурация обучения ParNetAutoencoder. Выход энкодера – структурированный парнет."""
 
-# Параметры модели
-INPUT_CHANNELS = 4          # число каналов сжатого парнета (обычно 4)
-BOTTLENECK_CHANNELS = 4     # размерность бутылочного горлышка (латента)
+INPUT_CHANNELS = 4
+BOTTLENECK_CHANNELS = 4          # размерность структурированного парнета
 BASE_DIM = 128
 NUM_BLOCKS = 2
 
@@ -20,7 +19,6 @@ DECODER_CONFIG = {
     "num_blocks": NUM_BLOCKS
 }
 
-# Устройства
 ENCODER_DEVICE_STR = "cuda:0"
 DECODER_DEVICE_STR = "cuda:0"
 
@@ -29,7 +27,7 @@ LEARNING_RATE = 0.001
 NUM_EPOCHS = 10000
 MAX_TRAIN_IMAGES = 427
 
-DATASET_DIR = "./prepared_dataset_parnet_compressed"
+DATASET_DIR = "./prepared_dataset_parnet_compressed"   # сжатые парнеты (вход)
 MODELS_DIR = "./models_parnet_ae"
 TESTS_DIR = "./tests_parnet_ae"
 VAL_TESTS_DIR = "./val_tests_parnet_ae"
@@ -43,9 +41,6 @@ NUM_TEST_EXAMPLES = 10
 RANDOM_SEED = 42
 CLEAR_CACHE_EACH_BATCH = True
 
-# Веса потерь
 DIFF_LOSS_WEIGHT = 100.0
-DIFF_SMOOTH_LOSS_WEIGHT = 200.0   # можно снизить для начала
-
-# Шум на латенте (можно отключить, т.к. латент уже Tanh)
+DIFF_SMOOTH_LOSS_WEIGHT = 200.0
 NOISE_STRENGTH = 0.0
