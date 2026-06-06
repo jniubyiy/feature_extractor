@@ -1,6 +1,7 @@
 # preparing_the_dataset_structured_parnet.py
 """
 Загружает сжатые парнеты, пропускает через ParNetEncoder и сохраняет структурированные парнеты.
+Параметры архитектуры берутся из конфига (ENCODER_BASE_DIM, ENCODER_NUM_BLOCKS).
 """
 import torch
 import concurrent.futures
@@ -9,7 +10,7 @@ from model_ParNetAutoencoder import ParNetEncoder
 from config_preparing_the_dataset_structured_parnet import *
 
 def process_single_parnet(args_tuple):
-    file_path_str, encoder_checkpoint, output_dir_str, device_str = args_tuple
+    file_path_str, encoder_checkpoint, output_dir_str, device_str, base_dim, num_blocks = args_tuple
     file_path = Path(file_path_str)
     output_path = Path(output_dir_str)
     device = torch.device(device_str)
@@ -17,20 +18,37 @@ def process_single_parnet(args_tuple):
     try:
         # Загружаем сжатый парнет
         data = torch.load(file_path, map_location='cpu', weights_only=False)
-        compressed = data['compressed_parnet'].unsqueeze(0)   # добавляем батч
+        compressed = data['compressed_parnet'].unsqueeze(0)
 
-        # Создаём энкодер и загружаем веса
-        model = ParNetEncoder(input_channels=4, bottleneck_channels=4, base_dim=128, num_blocks=2).to(device)
+        # Создаём энкодер с параметрами из конфига
+        encoder = ParNetEncoder(
+            input_channels=4,
+            bottleneck_channels=4,
+            base_dim=base_dim,
+            num_blocks=num_blocks
+        ).to(device)
+
+        # Загружаем чекпоинт
         checkpoint = torch.load(encoder_checkpoint, map_location=device, weights_only=False)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
         else:
             state_dict = checkpoint
-        model.load_state_dict(state_dict)
-        model.eval()
+
+        # Убираем префикс _orig_mod., если модель была сохранена через torch.compile
+        if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+        encoder.load_state_dict(state_dict)
+        encoder.eval()
 
         with torch.no_grad():
-            structured_parnet = model(compressed.to(device)).squeeze(0).cpu()
+            structured_parnet = encoder(compressed.to(device)).squeeze(0).cpu()
+
+        # Проверка на нули (с Tanh их быть не должно)
+        zero_count = (structured_parnet == 0).sum().item()
+        if zero_count > 0:
+            return (file_path.name, f"WARNING: {zero_count} zeros found")
 
         save_path = output_path / f"{file_path.stem}.pt"
         torch.save({"structured_parnet": structured_parnet}, save_path)
@@ -62,9 +80,13 @@ def main():
 
     print(f"Найдено {len(file_paths)} сжатых парнетов.")
     print(f"Используется энкодер: {encoder_path}")
-    print(f"Запуск обработки в {NUM_WORKERS} процессов (CPU)...")
+    print(f"Архитектура: base_dim={ENCODER_BASE_DIM}, num_blocks={ENCODER_NUM_BLOCKS}")
+    print(f"Запуск обработки в {NUM_WORKERS} процессов ({DEVICE})...")
 
-    tasks = [(str(p), ENCODER_CHECKPOINT, str(output_path), DEVICE) for p in file_paths]
+    tasks = [
+        (str(p), str(encoder_path), str(output_path), DEVICE, ENCODER_BASE_DIM, ENCODER_NUM_BLOCKS)
+        for p in file_paths
+    ]
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
         futures = {executor.submit(process_single_parnet, task): task[0] for task in tasks}
@@ -74,6 +96,8 @@ def main():
                 result = future.result()
                 if result[1] == "OK":
                     print(f"OK: {result[0]}")
+                elif result[1].startswith("WARNING"):
+                    print(f"WARNING: {result[0]} – {result[1]}")
                 else:
                     print(f"FAIL: {result[0]} – {result[1]}")
             except Exception as e:

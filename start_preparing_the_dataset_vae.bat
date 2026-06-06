@@ -2,5 +2,5 @@
 cd /d "%~dp0"
 call venv\Scripts\activate.bat
 set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python generate_from_noise_parnet.py
+python preparing_the_dataset_vae.py
 pause
