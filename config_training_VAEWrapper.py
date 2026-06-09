@@ -25,7 +25,7 @@ STOCHASTIC_DECODER_CONFIG = {
     "compressed_channels": 4,
     "stochastic_parnet_dim": 4,
     "hidden_dim": 512,
-    "num_res_blocks": 2,
+    "num_res_blocks": 4,
 }
 
 # ========================= Пути и имена директорий =========================
@@ -42,28 +42,31 @@ DECODER_CHECKPOINT = "./models/decoder_epoch73.pth"
 
 # ========================= Параметры обучения =========================
 BATCH_SIZE = 1
-LEARNING_RATE_ENCODER = 0.0000000001
-LEARNING_RATE_DECODER = 0.000000001
+LEARNING_RATE_ENCODER = 0.0000001
+LEARNING_RATE_DECODER = 0.000001
 NUM_EPOCHS = 100000
-MAX_TRAIN_IMAGES = 427
+MAX_TRAIN_IMAGES = 1
 VALIDATION_SPLIT = 10
 
 # ----------------------- Веса потерь ---------------------------------
 RECON_LOSS_WEIGHT = 100.0
 DIFF_SMOOTH_LOSS_WEIGHT = 100.0
-MU_LOSS_WEIGHT = 100000.0
+MU_LOSS_WEIGHT = 0.0
+MSE_LOSS_WEIGHT = 0.0   # или другое значение
+HYBRID_LOSS_WEIGHT = 0.0
 
 # ----------------------- Ручное управление шумом -----------------------
 STOCHASTIC_MODE = True
 STOCHASTIC_STRENGTH = 1.0
-LOG_VAR_VALUE = 1.0               # фиксированная log_var
+# Диапазон равномерного шума: шум ~ U[-NOISE_RANGE, NOISE_RANGE]
+NOISE_RANGE = 2.0
 
 # ----------------------- Сохранение и тестирование ---------------------
-SAVE_EVERY_EPOCHS = 1
+SAVE_EVERY_EPOCHS = 5
 MAX_CHECKPOINTS = 5
-VAL_EVERY_EPOCHS = 1
-TEST_EVERY_EPOCHS = 1
-NUM_TEST_EXAMPLES = 10
+VAL_EVERY_EPOCHS = 50
+TEST_EVERY_EPOCHS = 25
+NUM_TEST_EXAMPLES = 1
 TEST_SEED = 123
 RANDOM_SEED = 42
 

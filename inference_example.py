@@ -5,7 +5,6 @@
 Все модели хранятся в подпапках:
   ./models/                  – Encoder, Decoder основного автоэнкодера
   ./models_compressor/       – ParnetCompressor, ParnetDecompressor
-  ./models_parnet_ae/        – ParNetEncoder, ParNetDecoder (структурирование)
   ./models_vae_wrapper/      – StochasticEncoder, StochasticDecoder (VAE)
 
 Каждая модель загружается как автономный TorchScript-модуль.
@@ -77,7 +76,6 @@ def demo_encoder():
 def demo_decoder():
     print("=== 2. Decoder (парнет -> изображение) ===")
     decoder = load_inference_model("./models/decoder_inference.pt")
-    # Используем случайный парнет для демонстрации
     dummy_parnet = torch.randn(1, 3, 512, 512, device=DEVICE)
     with torch.no_grad():
         rec = decoder(dummy_parnet)
@@ -132,72 +130,21 @@ def demo_decompressor():
     print(f"Выход: {tuple(restored.shape)}")
     print(f"Диапазон восстановленного парнета: [{restored.min().item():.3f}, {restored.max().item():.3f}]\n")
 
-# ====================== 5. ParNetEncoder ===============================
-"""
-Модель: ParNetEncoder
-Файл: ./models_parnet_ae/encoder_inference.pt
-Назначение: преобразует сжатый парнет (4 канала, без ограничений) в структурированный парнет,
-            лежащий строго в диапазоне [-1, 1] (благодаря Tanh). Это подготавливает представление
-            для стохастического энкодера (VAE).
-Вход:  [1, 4, H/2, W/2] – сжатый парнет
-Выход: [1, 4, H/2, W/2] – структурированный парнет в [-1, 1]
-"""
-def demo_parnet_encoder():
-    print("=== 5. ParNetEncoder (сжатый парнет -> структурированный) ===")
-    parnet_enc = load_inference_model("./models_parnet_ae/encoder_inference.pt")
-    compressor = load_inference_model("./models_compressor/compressor_inference.pt")
-    encoder = load_inference_model("./models/encoder_inference.pt")
-    img = Image.new("RGB", (512, 512), color=(30, 180, 250))
-    x = image_to_tensor(img)
-    with torch.no_grad():
-        parnet = encoder(x)
-        comp = compressor(parnet)
-        structured = parnet_enc(comp)
-    print(f"Вход:  {tuple(comp.shape)}")
-    print(f"Выход: {tuple(structured.shape)}")
-    print(f"Диапазон структурированного: [{structured.min().item():.3f}, {structured.max().item():.3f}]\n")
-
-# ====================== 6. ParNetDecoder ===============================
-"""
-Модель: ParNetDecoder
-Файл: ./models_parnet_ae/decoder_inference.pt
-Назначение: восстанавливает сжатый парнет (4 канала) из структурированного (в [-1,1]).
-            Является обратной операцией к ParNetEncoder.
-Вход:  [1, 4, H/2, W/2] – структурированный парнет (в [-1,1])
-Выход: [1, 4, H/2, W/2] – восстановленный сжатый парнет (без ограничений)
-"""
-def demo_parnet_decoder():
-    print("=== 6. ParNetDecoder (структурированный -> сжатый парнет) ===")
-    parnet_dec = load_inference_model("./models_parnet_ae/decoder_inference.pt")
-    parnet_enc = load_inference_model("./models_parnet_ae/encoder_inference.pt")
-    compressor = load_inference_model("./models_compressor/compressor_inference.pt")
-    encoder = load_inference_model("./models/encoder_inference.pt")
-    img = Image.new("RGB", (512, 512), color=(90, 90, 90))
-    x = image_to_tensor(img)
-    with torch.no_grad():
-        parnet = encoder(x)
-        comp = compressor(parnet)
-        structured = parnet_enc(comp)
-        recovered_comp = parnet_dec(structured)
-    print(f"Вход:  {tuple(structured.shape)}")
-    print(f"Выход: {tuple(recovered_comp.shape)}")
-    print(f"Диапазон восстановленного сжатого парнета: [{recovered_comp.min().item():.3f}, {recovered_comp.max().item():.3f}]\n")
-
-# ====================== 7. StochasticEncoder ===========================
+# ====================== 5. StochasticEncoder ===========================
 """
 Модель: StochasticEncoder (с фиксированными параметрами шума)
 Файл: ./models_vae_wrapper/encoder_inference.pt
-Назначение: принимает структурированный парнет (в [-1,1]) и генерирует латентный вектор z
-            (сэмплированный с фиксированным шумом) и опорный шум noise_seed.
-            Шум внутри модели зафиксирован: LOG_VAR_VALUE = 1.0, STOCHASTIC_STRENGTH = 1.0.
-Вход:  [1, 4, H/2, W/2] – структурированный парнет (в [-1,1])
-Выход: z:         [1, 4, H/2, W/2] – стохастическое представление (в [-1,1]?)
+Назначение: принимает сжатый парнет (4 канала) и генерирует латентный вектор z
+            (mu + равномерный шум из [-NOISE_RANGE, NOISE_RANGE], масштабированный адаптивно)
+            и опорный шум noise_seed.
+            Параметры шума зафиксированы: NOISE_RANGE и STOCHASTIC_STRENGTH вшиты в модель.
+Вход:  [1, 4, H/2, W/2] – сжатый парнет
+Выход: z:         [1, 4, H/2, W/2] – стохастическое представление
        noise_seed:[1, 4, H/2, W/2] – опорный шум для декодера
 """
 def demo_stochastic_encoder():
-    print("=== 7. StochasticEncoder (структурированный -> z + noise_seed) ===")
+    print("=== 5. StochasticEncoder (сжатый парнет -> z + noise_seed) ===")
     stoch_enc = load_inference_model("./models_vae_wrapper/encoder_inference.pt")
-    parnet_enc = load_inference_model("./models_parnet_ae/encoder_inference.pt")
     compressor = load_inference_model("./models_compressor/compressor_inference.pt")
     encoder = load_inference_model("./models/encoder_inference.pt")
     img = Image.new("RGB", (512, 512), color=(200, 100, 50))
@@ -205,14 +152,13 @@ def demo_stochastic_encoder():
     with torch.no_grad():
         parnet = encoder(x)
         comp = compressor(parnet)
-        structured = parnet_enc(comp)
-        z, noise_seed = stoch_enc(structured)  # теперь модель возвращает сразу z и noise_seed
-    print(f"Вход:       {tuple(structured.shape)}")
+        z, noise_seed = stoch_enc(comp)
+    print(f"Вход:       {tuple(comp.shape)}")
     print(f"Выход z:    {tuple(z.shape)}")
     print(f"Выход seed: {tuple(noise_seed.shape)}")
     print(f"z диапазон: [{z.min().item():.3f}, {z.max().item():.3f}]\n")
 
-# ====================== 8. StochasticDecoder ===========================
+# ====================== 6. StochasticDecoder ===========================
 """
 Модель: StochasticDecoder
 Файл: ./models_vae_wrapper/decoder_inference.pt
@@ -222,10 +168,9 @@ def demo_stochastic_encoder():
 Выход: [1, 4, H/2, W/2] – декодированный сжатый парнет
 """
 def demo_stochastic_decoder():
-    print("=== 8. StochasticDecoder (z+noise_seed -> сжатый парнет) ===")
+    print("=== 6. StochasticDecoder (z+noise_seed -> сжатый парнет) ===")
     stoch_dec = load_inference_model("./models_vae_wrapper/decoder_inference.pt")
     stoch_enc = load_inference_model("./models_vae_wrapper/encoder_inference.pt")
-    parnet_enc = load_inference_model("./models_parnet_ae/encoder_inference.pt")
     compressor = load_inference_model("./models_compressor/compressor_inference.pt")
     encoder = load_inference_model("./models/encoder_inference.pt")
     img = Image.new("RGB", (512, 512), color=(150, 70, 200))
@@ -233,25 +178,22 @@ def demo_stochastic_decoder():
     with torch.no_grad():
         parnet = encoder(x)
         comp = compressor(parnet)
-        structured = parnet_enc(comp)
-        z, noise_seed = stoch_enc(structured)
+        z, noise_seed = stoch_enc(comp)
         combined = torch.cat([z, noise_seed], dim=1)
         decoded_comp = stoch_dec(combined)
     print(f"Вход:  {tuple(combined.shape)}")
     print(f"Выход: {tuple(decoded_comp.shape)}")
     print(f"Диапазон декодированного: [{decoded_comp.min().item():.3f}, {decoded_comp.max().item():.3f}]\n")
 
-# ====================== 9. Сквозной VAE пайплайн =======================
+# ====================== 7. Сквозной VAE пайплайн =======================
 """
-Полный VAE-пайплайн: изображение -> парнет -> сжатый парнет -> структурированный ->
-z + noise_seed -> декодированный сжатый парнет -> восстановленный парнет -> изображение.
-Все модели загружаются отдельно для наглядности.
+Полный VAE-пайплайн: изображение -> парнет -> сжатый парнет -> z + noise_seed ->
+декодированный сжатый парнет -> восстановленный парнет -> изображение.
 """
 def demo_full_vae_pipeline():
-    print("=== 9. Полный VAE-пайплайн (изображение -> VAE -> изображение) ===")
+    print("=== 7. Полный VAE-пайплайн (изображение -> VAE -> изображение) ===")
     encoder = load_inference_model("./models/encoder_inference.pt")
     compressor = load_inference_model("./models_compressor/compressor_inference.pt")
-    parnet_enc = load_inference_model("./models_parnet_ae/encoder_inference.pt")
     stoch_enc = load_inference_model("./models_vae_wrapper/encoder_inference.pt")
     stoch_dec = load_inference_model("./models_vae_wrapper/decoder_inference.pt")
     decompressor = load_inference_model("./models_compressor/decompressor_inference.pt")
@@ -266,8 +208,7 @@ def demo_full_vae_pipeline():
     with torch.no_grad():
         parnet = encoder(x)                             # [1,3,512,512]
         comp = compressor(parnet)                       # [1,4,256,256]
-        structured = parnet_enc(comp)                   # [1,4,256,256] в [-1,1]
-        z, noise_seed = stoch_enc(structured)           # [1,4,256,256] каждый
+        z, noise_seed = stoch_enc(comp)                 # каждый [1,4,256,256]
         combined = torch.cat([z, noise_seed], dim=1)    # [1,8,256,256]
         decoded_comp = stoch_dec(combined)              # [1,4,256,256]
         rest_parnet = decompressor(decoded_comp)        # [1,3,512,512]
@@ -284,8 +225,6 @@ if __name__ == "__main__":
     demo_decoder()
     demo_compressor()
     demo_decompressor()
-    demo_parnet_encoder()
-    demo_parnet_decoder()
     demo_stochastic_encoder()
     demo_stochastic_decoder()
     demo_full_vae_pipeline()

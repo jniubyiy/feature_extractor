@@ -4,11 +4,10 @@
 Поддерживаются модели из:
   - ./models/                  : Encoder, Decoder
   - ./models_compressor/       : ParnetCompressor, ParnetDecompressor
-  - ./models_parnet_ae/        : ParNetEncoder, ParNetDecoder
   - ./models_vae_wrapper/      : StochasticEncoder, StochasticDecoder, VAEWrapper
 
 StochasticEncoder экспортируется с фиксированными параметрами шума
-(STOCHASTIC_STRENGTH и LOG_VAR_VALUE), чтобы инференс не требовал внешних конфигураций.
+(NOISE_RANGE и STOCHASTIC_STRENGTH), чтобы инференс не требовал внешних конфигураций.
 """
 import torch
 import os
@@ -18,7 +17,6 @@ from pathlib import Path
 # Архитектуры
 from model_Autoencoder import Encoder, Decoder
 from model_ParnetCompressor import ParnetCompressor, ParnetDecompressor
-from model_ParNetAutoencoder import ParNetEncoder, ParNetDecoder
 from model_VAEWrapper import (
     StochasticEncoder, StochasticDecoder, VAEWrapper,
     reparameterize
@@ -31,20 +29,11 @@ from config_training_models_Encoder_Decoder import (
 from config_training_models_Compressor_Decompressor import (
     COMPRESSOR_CONFIG, DECOMPRESSOR_CONFIG
 )
-from config_preparing_the_dataset_structured_parnet import (
-    ENCODER_BASE_DIM, ENCODER_NUM_BLOCKS
-)
-from config_training_ParNetAutoencoder import (
-    INPUT_CHANNELS as PARNET_IN_CH,
-    BOTTLENECK_CHANNELS as PARNET_BN_CH,
-    BASE_DIM as PARNET_BASE_DIM,
-    NUM_BLOCKS as PARNET_NUM_BLOCKS
-)
 from config_training_VAEWrapper import (
     STOCHASTIC_ENCODER_CONFIG,
     STOCHASTIC_DECODER_CONFIG,
     IMAGE_SIZE as IMG_SIZE_VAE,
-    LOG_VAR_VALUE,
+    NOISE_RANGE,
     STOCHASTIC_STRENGTH
 )
 
@@ -54,19 +43,16 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Обёртка для StochasticEncoder: вшиваем параметры шума в TorchScript
 # ----------------------------------------------------------------------
 class StochasticEncoderInference(torch.nn.Module):
-    """Экспортирует StochasticEncoder + фиксированную репараметризацию."""
-    def __init__(self, encoder, log_var_value, strength):
+    """Экспортирует StochasticEncoder + фиксированную репараметризацию с равномерным шумом."""
+    def __init__(self, encoder, noise_range, strength):
         super().__init__()
         self.encoder = encoder
-        self.log_var_value = log_var_value
+        self.noise_range = noise_range
         self.strength = strength
 
     def forward(self, x):
         mu, noise_seed = self.encoder(x)
-        # Создаём тензор log_var, соответствующий форме mu
-        log_var = torch.full_like(mu, self.log_var_value)
-        z, eps, std = reparameterize(mu, log_var, self.strength)
-        # Возвращаем готовый z и noise_seed для декодера
+        z, _, _ = reparameterize(mu, self.noise_range, self.strength, noise_seed)
         return z, noise_seed
 
 # ----------------------------------------------------------------------
@@ -81,30 +67,7 @@ DIR_MODEL_MAP = {
         "compressor": (ParnetCompressor, COMPRESSOR_CONFIG, (3, IMG_SIZE_ENC, IMG_SIZE_ENC)),
         "decompressor": (ParnetDecompressor, DECOMPRESSOR_CONFIG, (4, IMG_SIZE_ENC // 2, IMG_SIZE_ENC // 2)),
     },
-    "./models_parnet_ae": {
-        "encoder": (
-            ParNetEncoder,
-            {
-                "input_channels": PARNET_IN_CH,
-                "bottleneck_channels": PARNET_BN_CH,
-                "base_dim": ENCODER_BASE_DIM,
-                "num_blocks": ENCODER_NUM_BLOCKS,
-            },
-            (PARNET_IN_CH, IMG_SIZE_ENC // 2, IMG_SIZE_ENC // 2),
-        ),
-        "decoder": (
-            ParNetDecoder,
-            {
-                "bottleneck_channels": PARNET_BN_CH,
-                "output_channels": PARNET_IN_CH,
-                "base_dim": PARNET_BASE_DIM,
-                "num_blocks": PARNET_NUM_BLOCKS,
-            },
-            (PARNET_BN_CH, IMG_SIZE_ENC // 2, IMG_SIZE_ENC // 2),
-        ),
-    },
     "./models_vae_wrapper": {
-        # encoder экспортируется через обёртку с шумом, см. логику в export_single_model
         "encoder": (
             StochasticEncoder,
             STOCHASTIC_ENCODER_CONFIG,
@@ -113,7 +76,6 @@ DIR_MODEL_MAP = {
         "decoder": (
             StochasticDecoder,
             STOCHASTIC_DECODER_CONFIG,
-            # Для трассировки нужен единый тензор, в который конкатенированы z и noise_seed
             (2 * STOCHASTIC_DECODER_CONFIG["stochastic_parnet_dim"], IMG_SIZE_VAE // 2, IMG_SIZE_VAE // 2),
         ),
         "vae_wrapper": (
@@ -137,7 +99,7 @@ def export_single_model(ckpt_path: Path, output_dir: Path,
     """
     Загружает веса, создаёт модель (возможно, с обёрткой) и экспортирует в TorchScript.
 
-    encoder_inference_params: (log_var_value, strength) только для StochasticEncoder.
+    encoder_inference_params: (noise_range, strength) только для StochasticEncoder.
     """
     print(f"Экспорт {model_name} из {ckpt_path} ...")
     base_model = model_cls(**config).to(DEVICE)
@@ -158,9 +120,9 @@ def export_single_model(ckpt_path: Path, output_dir: Path,
 
     # Определяем, какую модель будем трассировать
     if encoder_inference_params is not None:
-        # StochasticEncoder -> обёртка с фиксированным шумом
-        log_var_val, strength_val = encoder_inference_params
-        model_to_trace = StochasticEncoderInference(base_model, log_var_val, strength_val).to(DEVICE)
+        # StochasticEncoder -> обёртка с фиксированными параметрами шума
+        noise_range_val, strength_val = encoder_inference_params
+        model_to_trace = StochasticEncoderInference(base_model, noise_range_val, strength_val).to(DEVICE)
         example_input = torch.randn(1, *input_shape, device=DEVICE)
     elif isinstance(base_model, StochasticDecoder):
         # Для StochasticDecoder нужна обёртка, принимающая конкатенацию [z, noise_seed]
@@ -229,7 +191,7 @@ def main():
 
             # Особый случай: encoder из models_vae_wrapper использует фиксированные параметры шума
             if base_dir_str == "./models_vae_wrapper" and model_name == "encoder":
-                params = (LOG_VAR_VALUE, STOCHASTIC_STRENGTH)
+                params = (NOISE_RANGE, STOCHASTIC_STRENGTH)
                 export_single_model(ckpt_path, base_dir, model_cls, config, input_shape,
                                     model_name, encoder_inference_params=params)
             else:

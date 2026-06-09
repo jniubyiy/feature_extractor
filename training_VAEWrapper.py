@@ -1,12 +1,9 @@
 # training_VAEWrapper.py
 """
-Двухфазное обучение:
-  1) Декодер (StochasticDecoder) – предсказание сжатого парнета из z и noise_seed
-  2) Энкодер (StochasticEncoder) – генерация mu и noise_seed с регуляризацией mu
-
-Шум управляется вручную через LOG_VAR_VALUE.
-Датасет: структурированные парнеты (вход энкодера) и соответствующие сжатые парнеты (цель).
+Двухфазное обучение на сжатых парнетах с контролем детерминированности seed_tensor.
+При замороженном энкодере seed_tensor для одного и того же файла не должен меняться.
 """
+
 import os, re, glob, math, random, gc, json
 from pathlib import Path
 import torch
@@ -18,7 +15,6 @@ from PIL import Image
 
 from model_ParnetCompressor import ParnetDecompressor
 from model_Autoencoder import Decoder
-from model_ParNetAutoencoder import ParNetDecoder
 from model_VAEWrapper import (
     StochasticEncoder, StochasticDecoder,
     reparameterize
@@ -26,9 +22,36 @@ from model_VAEWrapper import (
 from config_training_VAEWrapper import *
 from config_training_models_Encoder_Decoder import DECODER_CONFIG
 from config_training_models_Compressor_Decompressor import DECOMPRESSOR_CONFIG
-from config_training_ParNetAutoencoder import DECODER_CONFIG as PARNET_DECODER_CONFIG
+
+# Резервные значения для отсутствующих параметров
+try:
+    MSE_LOSS_WEIGHT
+except NameError:
+    MSE_LOSS_WEIGHT = 1.0
+try:
+    HYBRID_LOSS_WEIGHT
+except NameError:
+    HYBRID_LOSS_WEIGHT = 1.0
 
 DEVICE = torch.device(DEVICE)
+
+# Глобальный реестр для проверки стабильности seed_tensor
+SEED_REGISTRY = {}
+
+def check_seed_consistency(file_path, seed_tensor, registry, phase="train"):
+    """
+    Сравнивает текущий seed_tensor с сохранённым для этого же файла.
+    Если значение изменилось (абсолютная разница > 1e-6), выводит предупреждение.
+    """
+    if file_path in registry:
+        ref = registry[file_path]
+        if not torch.allclose(seed_tensor, ref, atol=1e-6):
+            max_diff = (seed_tensor - ref).abs().max().item()
+            print(f"⚠️ WARNING [{phase}]: seed_tensor изменился для {os.path.basename(file_path)}! "
+                  f"Макс. разница: {max_diff:.6e}")
+            registry[file_path] = seed_tensor
+    else:
+        registry[file_path] = seed_tensor
 
 # ----------------------------------------------------------------------
 # Загрузка замороженных моделей (для визуализации)
@@ -54,44 +77,28 @@ def load_frozen_decoder(checkpoint_path):
     for p in model.parameters(): p.requires_grad = False
     return model
 
-def load_frozen_parnet_decoder(checkpoint_path):
-    model = ParNetDecoder(**PARNET_DECODER_CONFIG).to(DEVICE)
-    state = _load_state_dict_from_checkpoint(torch.load(checkpoint_path, map_location=DEVICE, weights_only=False))
-    model.load_state_dict(state)
-    model.eval()
-    for p in model.parameters(): p.requires_grad = False
-    return model
-
 # ----------------------------------------------------------------------
-# Датасет
+# Датасет (только сжатые парнеты)
 # ----------------------------------------------------------------------
-class StructuredCompressedDataset(Dataset):
+class CompressedOnlyDataset(Dataset):
+    """Загружает сжатые парнеты, возвращает (compressed, compressed) как вход и цель."""
     def __init__(self, file_list):
-        self.structured_files = file_list
-        self.compressed_dir = Path(COMPRESSED_DATASET_DIR)
+        self.files = file_list
 
     def __len__(self):
-        return len(self.structured_files)
+        return len(self.files)
 
     def __getitem__(self, idx):
-        struct_path = self.structured_files[idx]
-        fname = os.path.basename(struct_path)
-        comp_path = self.compressed_dir / fname
-        s_data = torch.load(struct_path, map_location='cpu', weights_only=False)
-        structured = s_data['structured_parnet']
-        if comp_path.exists():
-            c_data = torch.load(comp_path, map_location='cpu', weights_only=False)
-            compressed = c_data['compressed_parnet']
-        else:
-            raise FileNotFoundError(f"Сжатый парнет не найден: {comp_path}")
-        return structured, compressed, idx
+        data = torch.load(self.files[idx], map_location='cpu', weights_only=False)
+        compressed = data['compressed_parnet']   # [4, H, W]
+        return compressed, compressed, idx
 
 def collate_fn(batch):
-    structured, compressed, indices = zip(*batch)
-    structured = torch.stack(structured, dim=0)
-    compressed = torch.stack(compressed, dim=0)
+    inputs, targets, indices = zip(*batch)
+    inputs = torch.stack(inputs, dim=0)
+    targets = torch.stack(targets, dim=0)
     indices = torch.tensor(indices, dtype=torch.long)
-    return structured, compressed, indices
+    return inputs, targets, indices
 
 # ----------------------------------------------------------------------
 # Функции потерь
@@ -104,6 +111,15 @@ def diff_smooth_loss(pred, target):
     d_h = diff[:, :, 1:, :] - diff[:, :, :-1, :]
     d_w = diff[:, :, :, 1:] - diff[:, :, :, :-1]
     return d_h.abs().mean() + d_w.abs().mean()
+
+def mse_loss(pred, target):
+    return F.mse_loss(pred, target)
+
+def hybrid_loss(pred, target):
+    """Гибридная потеря: (x^2 * ln(1 + |x|)) / 2, усреднённая по всем элементам."""
+    diff = pred - target
+    loss = (diff ** 2) * torch.log(1.0 + torch.abs(diff)) / 2.0
+    return loss.mean()
 
 def compute_psnr(pred, target):
     mse = F.mse_loss(pred, target)
@@ -123,28 +139,21 @@ def save_json(tensor, path):
         json.dump(tensor.squeeze(0).cpu().tolist(), f)
 
 @torch.no_grad()
-def save_visualizations(eid, out_dir, structured, compressed, mu, noise_seed, z, decoded,
-                        parnet_decoder, decompressor, frozen_decoder):
+def save_visualizations(eid, out_dir, compressed, mu, seed_tensor, z, decoded,
+                        decompressor, frozen_decoder):
     os.makedirs(out_dir, exist_ok=True)
 
-    # Все тензоры уже с размерностью батча [1, C, H, W]
     if compressed is not None:
         img_orig = frozen_decoder(decompressor(compressed.to(DEVICE)))
         tensor_to_pil(img_orig[0]).save(os.path.join(out_dir, "original.png"))
 
-    # z как изображение двумя способами
-    z_par = parnet_decoder(z.to(DEVICE))
-    img_z_par = frozen_decoder(decompressor(z_par))
-    tensor_to_pil(img_z_par[0]).save(os.path.join(out_dir, "z_via_parnet_decoder.png"))
-    img_z_direct = frozen_decoder(decompressor(z.to(DEVICE)))
-    tensor_to_pil(img_z_direct[0]).save(os.path.join(out_dir, "z_direct.png"))
+    img_z = frozen_decoder(decompressor(z.to(DEVICE)))
+    tensor_to_pil(img_z[0]).save(os.path.join(out_dir, "z.png"))
 
-    # Выход StochasticDecoder (decoded) – напрямую
     img_dec = frozen_decoder(decompressor(decoded.to(DEVICE)))
     tensor_to_pil(img_dec[0]).save(os.path.join(out_dir, "decoded.png"))
 
-    # mu как изображение (через parnet_decoder)
-    img_mu = frozen_decoder(decompressor(parnet_decoder(mu.to(DEVICE))))
+    img_mu = frozen_decoder(decompressor(mu.to(DEVICE)))
     tensor_to_pil(img_mu[0]).save(os.path.join(out_dir, "mu.png"))
 
     if compressed is not None:
@@ -152,10 +161,13 @@ def save_visualizations(eid, out_dir, structured, compressed, mu, noise_seed, z,
         tensor_to_pil(diff_dec[0]).save(os.path.join(out_dir, "diff_decoded.png"))
 
     save_json(mu, os.path.join(out_dir, "mu.json"))
-    save_json(noise_seed, os.path.join(out_dir, "noise_seed.json"))
     save_json(z, os.path.join(out_dir, "z.json"))
+    seed_list = seed_tensor.squeeze(0).squeeze(-1).squeeze(-1).cpu().tolist()
+    with open(os.path.join(out_dir, "seed_tensor.json"), 'w') as f:
+        json.dump(seed_list, f)
 
     with open(os.path.join(out_dir, "metrics.txt"), 'w') as f:
+        f.write(f"Seed mean: {seed_tensor.mean().item():.4f}\n")
         if compressed is not None:
             l1_dec = F.l1_loss(img_dec, img_orig).item()
             psnr_dec = compute_psnr(img_dec, img_orig)
@@ -222,64 +234,78 @@ def load_checkpoint_if_exist(encoder, decoder, opt_enc, opt_dec):
         return 0
 
 # ----------------------------------------------------------------------
-# Валидация / тесты
+# Валидация / тесты с проверкой seed_tensor
 # ----------------------------------------------------------------------
 @torch.no_grad()
-def evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder, parnet_decoder,
-                           dataset, output_base, epoch, num_examples, log_var_const, seed=None):
+def evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder,
+                           dataset, output_base, epoch, num_examples, seed=None):
     if seed is not None: random.seed(seed)
     indices = random.sample(range(len(dataset)), min(num_examples, len(dataset)))
     for idx in indices:
-        structured, compressed, _ = dataset[idx]
-        structured = structured.unsqueeze(0).to(DEVICE)
+        compressed, _, _ = dataset[idx]
+        file_path = dataset.files[idx]
         compressed = compressed.unsqueeze(0).to(DEVICE)
 
-        mu, noise_seed = encoder(structured)
+        mu, seed_tensor = encoder(compressed)
+        check_seed_consistency(file_path, seed_tensor.detach().cpu(), SEED_REGISTRY, phase="eval")
+
         if STOCHASTIC_MODE:
-            z, _, _ = reparameterize(mu, log_var_const, STOCHASTIC_STRENGTH)
+            z, _, _ = reparameterize(mu, NOISE_RANGE, STOCHASTIC_STRENGTH, seed_tensor)
         else:
             z = mu
-        decoded = decoder(z, noise_seed)
+        decoded = decoder(z, seed_tensor)
 
-        eid = os.path.splitext(os.path.basename(dataset.structured_files[idx]))[0]
+        eid = os.path.splitext(os.path.basename(file_path))[0]
         base_dir = os.path.join(output_base, f"epoch_{epoch}", f"example_{eid}")
-        save_visualizations(eid, base_dir, structured, compressed, mu, noise_seed, z, decoded,
-                            parnet_decoder, decompressor, frozen_decoder)
+        save_visualizations(eid, base_dir, compressed, mu, seed_tensor, z, decoded,
+                            decompressor, frozen_decoder)
 
 # ----------------------------------------------------------------------
-# Тренировочная эпоха (две фазы)
+# Тренировочная эпоха с проверкой seed_tensor в фазе 1
 # ----------------------------------------------------------------------
-def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, log_var_const):
+def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec):
     encoder.train(); decoder.train()
     total_loss1 = 0.0; total_loss2 = 0.0
     total_ds1 = 0.0; total_ds2 = 0.0
+    total_mse1 = 0.0; total_mse2 = 0.0
+    total_hyb1 = 0.0; total_hyb2 = 0.0
     total_mu_reg = 0.0
     n_batches = 0
 
-    for batch_idx, (struct, comp, indices) in enumerate(train_loader):
-        struct = struct.to(DEVICE)
-        comp = comp.to(DEVICE)
+    for batch_idx, (inputs, targets, indices) in enumerate(train_loader):
+        inputs = inputs.to(DEVICE)
+        targets = targets.to(DEVICE)
         saved_grads_enc = {}; saved_grads_dec = {}
 
-        # ===== Фаза 1: Декодер =====
+        # ===== Фаза 1: Декодер (энкодер заморожен) =====
         for p in encoder.parameters(): p.requires_grad = False
         for p in decoder.parameters(): p.requires_grad = True
         opt_dec.zero_grad()
 
         with torch.no_grad():
-            mu, noise_seed = encoder(struct)
+            mu, seed_tensor = encoder(inputs)
 
-        loss1_sum = 0.0; ds1_sum = 0.0
+        # Проверка стабильности seed_tensor для каждого элемента батча
+        for i in range(len(indices)):
+            file_path = train_loader.dataset.files[indices[i].item()]
+            check_seed_consistency(file_path, seed_tensor[i:i+1].detach().cpu(),
+                                   SEED_REGISTRY, phase="train_phase1")
+
+        loss1_sum = 0.0; ds1_sum = 0.0; mse1_sum = 0.0; hyb1_sum = 0.0
         for _ in range(NUM_MC_SAMPLES):
             if STOCHASTIC_MODE:
-                z, _, _ = reparameterize(mu, log_var_const, STOCHASTIC_STRENGTH)
+                z, _, _ = reparameterize(mu, NOISE_RANGE, STOCHASTIC_STRENGTH, seed_tensor)
             else:
                 z = mu
-            decoded = decoder(z, noise_seed)
-            rec = RECON_LOSS_WEIGHT * difference_loss(decoded, comp)
-            smooth = DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(decoded, comp)
-            loss1_sum += rec + smooth
+            decoded = decoder(z, seed_tensor)
+            rec = RECON_LOSS_WEIGHT * difference_loss(decoded, targets)
+            smooth = DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(decoded, targets)
+            mse = MSE_LOSS_WEIGHT * mse_loss(decoded, targets)
+            hyb = HYBRID_LOSS_WEIGHT * hybrid_loss(decoded, targets)
+            loss1_sum += rec + smooth + mse + hyb
             ds1_sum += smooth
+            mse1_sum += mse
+            hyb1_sum += hyb
 
         loss1_avg = loss1_sum / NUM_MC_SAMPLES
         loss1_avg.backward()
@@ -288,24 +314,30 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, log_var_const)
         opt_dec.zero_grad()
         loss1_val = loss1_avg.item()
         ds1_val = ds1_sum.item() / NUM_MC_SAMPLES
+        mse1_val = mse1_sum.item() / NUM_MC_SAMPLES
+        hyb1_val = hyb1_sum.item() / NUM_MC_SAMPLES
 
         # ===== Фаза 2: Энкодер =====
         for p in encoder.parameters(): p.requires_grad = True
         for p in decoder.parameters(): p.requires_grad = False
         opt_enc.zero_grad()
 
-        mu, noise_seed = encoder(struct)
-        loss2_sum = 0.0; ds2_sum = 0.0
+        mu, seed_tensor = encoder(inputs)
+        loss2_sum = 0.0; ds2_sum = 0.0; mse2_sum = 0.0; hyb2_sum = 0.0
         for _ in range(NUM_MC_SAMPLES):
             if STOCHASTIC_MODE:
-                z, _, _ = reparameterize(mu, log_var_const, STOCHASTIC_STRENGTH)
+                z, _, _ = reparameterize(mu, NOISE_RANGE, STOCHASTIC_STRENGTH, seed_tensor)
             else:
                 z = mu
-            decoded = decoder(z, noise_seed)
-            rec = RECON_LOSS_WEIGHT * difference_loss(decoded, comp)
-            smooth = DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(decoded, comp)
-            loss2_sum += rec + smooth
+            decoded = decoder(z, seed_tensor)
+            rec = RECON_LOSS_WEIGHT * difference_loss(decoded, targets)
+            smooth = DIFF_SMOOTH_LOSS_WEIGHT * diff_smooth_loss(decoded, targets)
+            mse = MSE_LOSS_WEIGHT * mse_loss(decoded, targets)
+            hyb = HYBRID_LOSS_WEIGHT * hybrid_loss(decoded, targets)
+            loss2_sum += rec + smooth + mse + hyb
             ds2_sum += smooth
+            mse2_sum += mse
+            hyb2_sum += hyb
 
         mu_reg = encoder._orig_mod.mu_regularization(mu)
         mu_weighted = MU_LOSS_WEIGHT * mu_reg
@@ -316,9 +348,11 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, log_var_const)
         opt_enc.zero_grad()
         loss2_val = loss2_avg.item()
         ds2_val = ds2_sum.item() / NUM_MC_SAMPLES
+        mse2_val = mse2_sum.item() / NUM_MC_SAMPLES
+        hyb2_val = hyb2_sum.item() / NUM_MC_SAMPLES
         mu_val = mu_weighted.item()
 
-        # Применяем градиенты
+        # Применяем градиенты фаз 1 и 2
         for name, param in decoder.named_parameters():
             if name in saved_grads_dec: param.grad = saved_grads_dec[name].to(param.device)
             else: param.grad = None
@@ -333,25 +367,31 @@ def train_epoch(encoder, decoder, train_loader, opt_enc, opt_dec, log_var_const)
 
         total_loss1 += loss1_val; total_loss2 += loss2_val
         total_ds1 += ds1_val; total_ds2 += ds2_val
+        total_mse1 += mse1_val; total_mse2 += mse2_val
+        total_hyb1 += hyb1_val; total_hyb2 += hyb2_val
         total_mu_reg += mu_val
         n_batches += 1
 
         print(f"Batch {batch_idx+1}/{len(train_loader)} | "
-              f"Ph1(Dec): {loss1_val:.6f} | Ph2(Enc): {loss2_val:.6f} | "
-              f"Mu: {mu_val:.6f} | DSm1: {ds1_val:.4f} | DSm2: {ds2_val:.4f}")
+              f"Ph1(Dec): {loss1_val:.6f} (MSE:{mse1_val:.6f} HYB:{hyb1_val:.6f}) | "
+              f"Ph2(Enc): {loss2_val:.6f} (MSE:{mse2_val:.6f} HYB:{hyb2_val:.6f}) | "
+              f"Mu: {mu_val:.6f} | DSm1: {ds1_val:.4f} DSm2: {ds2_val:.4f}")
 
-        del struct, comp, mu, noise_seed, z, decoded
+        del inputs, targets, mu, seed_tensor, z, decoded
         if CLEAR_CACHE_EACH_BATCH and torch.cuda.is_available():
             torch.cuda.empty_cache(); gc.collect()
 
     return (total_loss1/n_batches, total_loss2/n_batches,
             total_ds1/n_batches, total_ds2/n_batches,
+            total_mse1/n_batches, total_mse2/n_batches,
+            total_hyb1/n_batches, total_hyb2/n_batches,
             total_mu_reg/n_batches)
 
 # ----------------------------------------------------------------------
 # Основная функция
 # ----------------------------------------------------------------------
 def main():
+    global SEED_REGISTRY
     torch.manual_seed(RANDOM_SEED); random.seed(RANDOM_SEED)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(RANDOM_SEED)
 
@@ -359,34 +399,27 @@ def main():
     decompressor = load_frozen_decompressor(DECOMPRESSOR_CHECKPOINT)
     print("Loading frozen decoder...")
     frozen_decoder = load_frozen_decoder(DECODER_CHECKPOINT)
-    print("Loading frozen ParNet decoder...")
-    parnet_decoder = load_frozen_parnet_decoder(AE_CHECKPOINT)
 
-    all_struct_files = sorted(Path(STRUCTURED_DATASET_DIR).glob("*.pt"))
-    all_struct_files = [f for f in all_struct_files if f.name != "similarities.pt"]
-    valid_files = []
-    for f in all_struct_files:
-        comp_f = Path(COMPRESSED_DATASET_DIR) / f.name
-        if comp_f.exists():
-            valid_files.append(f)
-    print(f"Found {len(valid_files)} paired samples (structured + compressed).")
-    if not valid_files:
-        raise RuntimeError("No paired structured/compressed files found.")
+    all_files = sorted(Path(COMPRESSED_DATASET_DIR).glob("*.pt"))
+    all_files = [f for f in all_files if f.name != "similarities.pt"]
+    print(f"Found {len(all_files)} compressed parnet samples.")
+    if not all_files:
+        raise RuntimeError("No compressed parnet files found.")
 
     if MAX_TRAIN_IMAGES and MAX_TRAIN_IMAGES > 0:
-        train_files = valid_files[:MAX_TRAIN_IMAGES]
+        train_files = all_files[:MAX_TRAIN_IMAGES]
         start_val = len(train_files)
-        val_files = valid_files[start_val:start_val + VALIDATION_SPLIT] if start_val < len(valid_files) else []
+        val_files = all_files[start_val:start_val + VALIDATION_SPLIT] if start_val < len(all_files) else []
     else:
-        n_val = min(VALIDATION_SPLIT, len(valid_files))
-        train_files = valid_files[:-n_val] if n_val < len(valid_files) else []
-        val_files = valid_files[-n_val:] if n_val > 0 else []
+        n_val = min(VALIDATION_SPLIT, len(all_files))
+        train_files = all_files[:-n_val] if n_val < len(all_files) else []
+        val_files = all_files[-n_val:] if n_val > 0 else []
 
     print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
-    train_dataset = StructuredCompressedDataset(train_files)
+    train_dataset = CompressedOnlyDataset(train_files)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_fn, pin_memory=True, num_workers=0)
-    val_dataset = StructuredCompressedDataset(val_files) if val_files else None
+    val_dataset = CompressedOnlyDataset(val_files) if val_files else None
 
     encoder = StochasticEncoder(**STOCHASTIC_ENCODER_CONFIG).to(DEVICE)
     decoder = StochasticDecoder(**STOCHASTIC_DECODER_CONFIG).to(DEVICE)
@@ -399,31 +432,33 @@ def main():
     encoder = torch.compile(encoder, backend="aot_eager")
     decoder = torch.compile(decoder, backend="aot_eager")
 
-    log_var_const = torch.full((1,), LOG_VAR_VALUE, device=DEVICE)
-
     print(f"STOCHASTIC_MODE = {STOCHASTIC_MODE} | "
           f"STOCHASTIC_STRENGTH = {STOCHASTIC_STRENGTH} | "
-          f"LOG_VAR_VALUE = {LOG_VAR_VALUE} | "
-          f"Fixed STD = {math.exp(0.5 * LOG_VAR_VALUE):.4f}")
-    print(f"MU_LOSS_WEIGHT = {MU_LOSS_WEIGHT} | NUM_MC_SAMPLES = {NUM_MC_SAMPLES}")
+          f"NOISE_RANGE = {NOISE_RANGE} | "
+          f"Effective noise limit = ±{NOISE_RANGE * STOCHASTIC_STRENGTH:.4f}")
+    print(f"MU_LOSS_WEIGHT = {MU_LOSS_WEIGHT} | NUM_MC_SAMPLES = {NUM_MC_SAMPLES} | "
+          f"MSE_LOSS_WEIGHT = {MSE_LOSS_WEIGHT} | HYBRID_LOSS_WEIGHT = {HYBRID_LOSS_WEIGHT}")
+    print("Seed consistency check enabled for frozen encoder phases.")
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         print(f"\n--- Epoch {epoch} ---")
-        avg_l1, avg_l2, avg_ds1, avg_ds2, avg_mu = train_epoch(
-            encoder, decoder, train_loader, opt_enc, opt_dec, log_var_const
+        avg_l1, avg_l2, avg_ds1, avg_ds2, avg_mse1, avg_mse2, avg_hyb1, avg_hyb2, avg_mu = train_epoch(
+            encoder, decoder, train_loader, opt_enc, opt_dec
         )
-        print(f"Epoch {epoch:3d} | Ph1: {avg_l1:.6f} | Ph2: {avg_l2:.6f} | "
-              f"Mu: {avg_mu:.6f} | DSm1: {avg_ds1:.4f} | DSm2: {avg_ds2:.4f}")
+        print(f"Epoch {epoch:3d} | "
+              f"Ph1: {avg_l1:.6f} (MSE:{avg_mse1:.6f} HYB:{avg_hyb1:.6f}) | "
+              f"Ph2: {avg_l2:.6f} (MSE:{avg_mse2:.6f} HYB:{avg_hyb2:.6f}) | "
+              f"Mu: {avg_mu:.6f}")
 
         if val_dataset and epoch % VAL_EVERY_EPOCHS == 0:
             print("Running validation...")
-            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder, parnet_decoder,
-                                   val_dataset, VAL_TESTS_DIR, epoch, NUM_TEST_EXAMPLES, log_var_const, TEST_SEED)
+            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder,
+                                   val_dataset, VAL_TESTS_DIR, epoch, NUM_TEST_EXAMPLES, TEST_SEED)
 
         if epoch % TEST_EVERY_EPOCHS == 0:
             print("Running tests...")
-            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder, parnet_decoder,
-                                   train_dataset, TESTS_DIR, epoch, NUM_TEST_EXAMPLES, log_var_const, TEST_SEED)
+            evaluate_and_visualize(encoder, decoder, decompressor, frozen_decoder,
+                                   train_dataset, TESTS_DIR, epoch, NUM_TEST_EXAMPLES, TEST_SEED)
 
         if epoch % SAVE_EVERY_EPOCHS == 0:
             save_checkpoint(epoch, encoder, decoder, opt_enc, opt_dec)

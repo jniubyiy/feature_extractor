@@ -1,20 +1,82 @@
 # model_VAEWrapper.py
 """
-StochasticEncoder (mu, noise_seed) и StochasticDecoder.
-Ручное управление шумом через LOG_VAR_VALUE.
-Семплирование: z = mu + ε * exp(0.5 * log_var), ε ~ N(0,1).
+StochasticEncoder (mu, seed_tensor) и StochasticDecoder.
+seed_tensor – тензор [B, 16, 1, 1] со значениями в [-1, 1],
+детерминированно порождаемый из входного сжатого парнета
+по математической формуле (без обучаемых параметров).
+Он не зависит от обучаемых весов энкодера, поэтому для одного и того же
+входного сжатого парнета всегда одинаков.
+
+Из seed_tensor напрямую вычисляется целочисленный ключ (хеш),
+который используется для инициализации генератора шума.
+Это гарантирует, что для одного и того же входа шум всегда одинаков.
+
+Адаптивное масштабирование шума:
+- Если mu_abs_mean > noise_abs_mean: scale = 1 + noise/mu (z ~ mu).
+- Иначе (шум доминирует): scale = (mu + noise)/noise (z ~ noise).
+
+Шум равномерный в диапазоне [-NOISE_RANGE, NOISE_RANGE], умноженный на STOCHASTIC_STRENGTH.
+StochasticDecoder использует seed_tensor как специализированную подсказку
+через FiLM-слой.
 """
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def reparameterize(mu, log_var, strength=1.0):
-    """Семплирует z = mu + ε * exp(0.5 * log_var). Возвращает z, ε, σ."""
-    std = torch.exp(0.5 * log_var) * strength
-    eps = torch.randn_like(mu)
-    z = mu + eps * std
-    return z, eps, std
+# ---------- Хеш тензора для генератора ----------
+def seed_tensor_hash(seed_tensor: torch.Tensor) -> torch.Tensor:
+    raw = seed_tensor.sum(dim=(1, 2, 3))  # [B]
+    hash_int = (raw.abs() * 1e9).long() % (2**63 - 1)
+    return hash_int.to(seed_tensor.device)
+
+
+def reparameterize(mu, noise_range, strength, seed_tensor):
+    """
+    Добавляет к mu равномерный шум с адаптивным масштабированием.
+    
+    Параметры:
+        mu: [B, C, H, W]
+        noise_range: float – граница равномерного шума (шум из U[-range, range])
+        strength: float – множитель шума
+        seed_tensor: [B, 16, 1, 1] – для детерминированного шума
+    
+    Возвращает:
+        z: [B, C, H, W] = (mu + noise*strength) / scale
+        raw_noise: [B, C, H, W] – сгенерированный шум (без множителя и scale)
+        scale: [B] – применённый масштаб (для информации)
+    """
+    hash_int = seed_tensor_hash(seed_tensor)
+    B = mu.size(0)
+    z_list, noise_list, scale_list = [], [], []
+
+    for i in range(B):
+        gen = torch.Generator(device=mu.device)
+        gen.manual_seed(hash_int[i].item())
+
+        # Равномерный шум в [-noise_range, noise_range]
+        raw_noise = (torch.rand(mu[i].shape, generator=gen, device=mu.device) * 2 - 1) * noise_range
+        effective_noise = raw_noise * strength
+
+        mu_abs_mean = mu[i].abs().mean() + 1e-8
+        noise_abs_mean = effective_noise.abs().mean()
+
+        if mu_abs_mean > noise_abs_mean:
+            scale = 1.0 + noise_abs_mean / mu_abs_mean
+        else:
+            scale = (mu_abs_mean + noise_abs_mean) / noise_abs_mean
+
+        z_i = (mu[i] + effective_noise) / scale
+
+        z_list.append(z_i.unsqueeze(0))
+        noise_list.append(raw_noise.unsqueeze(0))
+        scale_list.append(scale)
+
+    z = torch.cat(z_list, dim=0)
+    noise_batch = torch.cat(noise_list, dim=0)
+    scale_batch = torch.stack(scale_list, dim=0)  # [B]
+    return z, noise_batch, scale_batch
 
 
 # ---------- Базовые блоки ----------
@@ -93,7 +155,7 @@ class StochasticDynamicContextResidualBlock(nn.Module):
         return x + delta
 
 
-# ---------- Вспомогательные модули для извлечения признаков из z ----------
+# ---------- Вспомогательные модули (SWT, Sobel, Laplace, ResBlock) ----------
 class SWTHaar(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -163,7 +225,8 @@ class ResidualConvBlock(nn.Module):
 
 # ---------- Основные модели ----------
 class StochasticEncoder(nn.Module):
-    """Генерирует mu (в [-1,1]) и noise_seed (неограниченный)."""
+    """Генерирует mu (без ограничения диапазона) и seed_tensor [B, 16, 1, 1]
+       по чисто математической формуле от исходного входа (не зависит от весов)."""
     def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
                  hidden_dim=128, num_res_blocks=4, **kwargs):
         super().__init__()
@@ -172,62 +235,66 @@ class StochasticEncoder(nn.Module):
         self.global_blocks = nn.Sequential(*[
             StochasticGlobalContextBlock(hidden_dim) for _ in range(num_res_blocks)
         ])
-        # Голова для mu
         self.compress_mu = nn.Conv2d(hidden_dim, stochastic_parnet_dim, kernel_size=3, padding=1)
         self.dynamic_refine_mu = StochasticDynamicContextResidualBlock(stochastic_parnet_dim, hidden_dim)
-        # Голова для noise_seed
-        self.compress_seed = nn.Conv2d(hidden_dim, stochastic_parnet_dim, kernel_size=3, padding=1)
-        self.dynamic_refine_seed = StochasticDynamicContextResidualBlock(stochastic_parnet_dim, hidden_dim)
 
     def forward(self, x):
+        # Вычисляем seed_tensor из исходного входа (не зависит от весов)
+        abs_mean = x.abs().mean(dim=(2,3))
+        freqs = torch.linspace(1.0, 10.0, 16, device=x.device).view(1, 16)
+        phases = torch.linspace(0.0, 3.1415, 16, device=x.device).view(1, 16)
+        weights = torch.ones(x.shape[1], 16, device=x.device) / x.shape[1]
+        mixed = torch.matmul(abs_mean, weights)
+        seed_raw = torch.sin(mixed * freqs + phases)
+        seed_tensor = seed_raw.unsqueeze(-1).unsqueeze(-1)  # [B, 16, 1, 1]
+
+        # Обучаемая часть
         x = self.init_conv(x)
         ctx = self.global_blocks(x)
         mu = self.compress_mu(ctx)
         mu = self.dynamic_refine_mu(mu, ctx)
-        mu = torch.tanh(mu)
-        noise_seed = self.compress_seed(ctx)
-        noise_seed = self.dynamic_refine_seed(noise_seed, ctx)
-        return mu, noise_seed
+
+        return mu, seed_tensor
 
     def mu_regularization(self, mu):
-        """L2-регуляризация mu (притягивает к нулю)."""
         return mu.pow(2).mean()
 
 
 class StochasticDecoder(nn.Module):
     """Декодер с аналитическими признаками.
-       Принимает z и noise_seed, возвращает структурированный парнет без tanh."""
+       Принимает z [B, C, H, W] и seed_tensor [B, 16, 1, 1].
+    """
     def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
                  hidden_dim=128, num_res_blocks=6, **kwargs):
         super().__init__()
         C = stochastic_parnet_dim
-        # Проекция объединённого входа до C каналов для совместимости с анализом признаков
-        self.input_proj = nn.Conv2d(2 * C, C, kernel_size=1)
         self.swt = SWTHaar(C)
         self.sobel = SobelFilter(C)
         self.laplacian = LaplacianFilter(C)
 
-        total_in = C + 4*C + 3*C + 2*C + 2*C + 2*C   # 14*C
+        total_in = C + 4*C + 3*C + 2*C + 2*C + 2*C
         self.preprocess = nn.Sequential(
             nn.Conv2d(total_in, hidden_dim, kernel_size=3, padding=1),
             ResidualConvBlock(hidden_dim),
             ResidualConvBlock(hidden_dim),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
         )
+
+        self.film_generator = nn.Sequential(
+            nn.Conv2d(16, 64, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(64, hidden_dim * 2, kernel_size=1)
+        )
+
         self.global_blocks = nn.Sequential(*[
             StochasticGlobalContextBlock(hidden_dim) for _ in range(num_res_blocks)
         ])
         self.compress = nn.Conv2d(hidden_dim, compressed_channels, kernel_size=3, padding=1)
         self.dynamic_refine = StochasticDynamicContextResidualBlock(compressed_channels, hidden_dim)
-        # Без финального tanh
 
-    def forward(self, z, noise_seed):
-        # Объединяем z и noise_seed по каналам и проецируем до C
-        combined = torch.cat([z, noise_seed], dim=1)   # B, 2C, H, W
-        combined = self.input_proj(combined)           # B, C, H, W
-
-        B, C, H, W = combined.shape
-        LL, LH, HL, HH = self.swt(combined)
+    def forward(self, z, seed_tensor):
+        C = z.shape[1]
+        LL, LH, HL, HH = self.swt(z)
 
         def local_var(x):
             mu = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
@@ -238,17 +305,17 @@ class StochasticDecoder(nn.Module):
         var_HL = local_var(HL)
         var_HH = local_var(HH)
 
-        grad_z = self.sobel(combined)
+        grad_z = self.sobel(z)
         grad_LL = self.sobel(LL)
 
-        lap_z = self.laplacian(combined)
+        lap_z = self.laplacian(z)
         lap_LL = self.laplacian(LL)
 
-        avg3 = F.avg_pool2d(combined, kernel_size=3, stride=1, padding=1)
-        avg5 = F.avg_pool2d(combined, kernel_size=5, stride=1, padding=2)
+        avg3 = F.avg_pool2d(z, kernel_size=3, stride=1, padding=1)
+        avg5 = F.avg_pool2d(z, kernel_size=5, stride=1, padding=2)
 
         features = torch.cat([
-            combined,
+            z,
             LL, LH, HL, HH,
             var_LH, var_HL, var_HH,
             grad_z, grad_LL,
@@ -257,14 +324,18 @@ class StochasticDecoder(nn.Module):
         ], dim=1)
 
         x = self.preprocess(features)
+
+        film_params = self.film_generator(seed_tensor)
+        scale, bias = torch.chunk(film_params, 2, dim=1)
+        x = x * scale + bias
+
         ctx = self.global_blocks(x)
         mid = self.compress(ctx)
         out = self.dynamic_refine(mid, ctx)
-        return out   # без tanh
+        return out
 
 
 class VAEWrapper(nn.Module):
-    """Обёртка, содержащая encoder и decoder."""
     def __init__(self, compressed_channels=4, stochastic_parnet_dim=4,
                  hidden_dim=128, **kwargs):
         super().__init__()
@@ -272,6 +343,5 @@ class VAEWrapper(nn.Module):
         self.decoder = StochasticDecoder(compressed_channels, stochastic_parnet_dim, hidden_dim, **kwargs)
 
     def forward(self, x):
-        mu, noise_seed = self.encoder(x)
-        # Возвращаем mu, noise_seed и фиктивную log_var для совместимости
-        return mu, noise_seed, torch.zeros_like(mu)
+        mu, seed_tensor = self.encoder(x)
+        return mu, seed_tensor

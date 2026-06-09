@@ -1,7 +1,7 @@
 # preparing_the_dataset_vae.py
 """
-Скрипт подготовки датасета для VAE: применяет StochasticEncoder к структурированным парнетам,
-генерирует z и noise_seed с фиксированным шумом, сохраняет combined (z+noise_seed) и целевой сжатый парнет.
+Скрипт подготовки датасета для VAE: применяет StochasticEncoder к сжатым парнетам,
+генерирует z и noise_seed с фиксированным равномерным шумом, сохраняет combined (z+noise_seed) и целевой сжатый парнет.
 """
 import torch
 import concurrent.futures
@@ -12,25 +12,20 @@ from config_preparing_the_dataset_vae import *
 
 def process_single_item(args_tuple):
     """
-    Загружает структурированный и сжатый парнеты, пропускает через StochasticEncoder,
+    Загружает сжатый парнет (теперь напрямую, без структурированного), пропускает через StochasticEncoder,
     вычисляет z и noise_seed, объединяет их и сохраняет вместе с целевым сжатым парнетом.
     """
-    (struct_path_str, comp_path_str, output_dir_str, device_str,
-     encoder_config, encoder_checkpoint, log_var_val, strength) = args_tuple
+    (comp_path_str, output_dir_str, device_str,
+     encoder_config, encoder_checkpoint, noise_range, strength) = args_tuple
 
-    struct_path = Path(struct_path_str)
     comp_path = Path(comp_path_str)
     output_path = Path(output_dir_str)
     device = torch.device(device_str)
 
     try:
-        # Загружаем структурированный парнет
-        struct_data = torch.load(struct_path, map_location='cpu', weights_only=False)
-        structured = struct_data['structured_parnet'].unsqueeze(0)  # [1, C, H, W]
-
-        # Загружаем целевой сжатый парнет
+        # Загружаем сжатый парнет
         comp_data = torch.load(comp_path, map_location='cpu', weights_only=False)
-        compressed_target = comp_data['compressed_parnet']  # [C, H, W] – цель
+        compressed = comp_data['compressed_parnet'].unsqueeze(0)  # [1, C, H, W]
 
         # Создаём энкодер и загружаем веса
         encoder = StochasticEncoder(**encoder_config).to(device)
@@ -50,31 +45,29 @@ def process_single_item(args_tuple):
 
         # Инференс энкодера
         with torch.no_grad():
-            mu, noise_seed = encoder(structured.to(device))
+            mu, noise_seed = encoder(compressed.to(device))
 
-            # Фиксированная репараметризация (как в экспортированной модели)
-            log_var = torch.full_like(mu, log_var_val)
-            z, _, _ = reparameterize(mu, log_var, strength)
+            # Равномерный шум с заданными параметрами
+            z, _, _ = reparameterize(mu, noise_range, strength, noise_seed)
 
             # Объединяем z и noise_seed в один тензор (как ожидает StochasticDecoder)
             combined = torch.cat([z, noise_seed], dim=1)  # [1, 2*C, H, W]
 
         # Сохраняем результат
-        save_path = output_path / f"{struct_path.stem}.pt"
+        save_path = output_path / f"{comp_path.stem}.pt"
         torch.save({
             "combined": combined.squeeze(0).cpu(),          # вход для декодера
-            "compressed_parnet": compressed_target.cpu()    # целевой сжатый парнет
+            "compressed_parnet": compressed.squeeze(0).cpu()  # целевой сжатый парнет (копия исходного)
         }, save_path)
 
-        return (struct_path.name, "OK")
+        return (comp_path.name, "OK")
 
     except Exception as e:
-        return (struct_path.name, f"ERROR: {e}")
+        return (comp_path.name, f"ERROR: {e}")
 
 
 def main():
-    struct_dir = Path(DATASET_STRUCT_DIR)
-    comp_dir = Path(DATASET_COMP_DIR)
+    comp_dir = Path(DATASET_COMP_DIR)   # используем DATASET_COMP_DIR (сжатые парнеты)
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,37 +76,29 @@ def main():
     if not encoder_checkpoint_path.exists():
         raise FileNotFoundError(f"Encoder checkpoint not found: {encoder_checkpoint_path}")
 
-    # Собираем пары структурированный/сжатый парнет
-    struct_files = sorted(struct_dir.glob("*.pt"))
-    valid_pairs = []
-    for sf in struct_files:
-        if sf.name == "similarities.pt":
-            continue
-        cf = comp_dir / sf.name
-        if cf.exists():
-            valid_pairs.append((sf, cf))
-        else:
-            print(f"Пропущен {sf.name}: нет сжатого парнета {cf}")
+    # Собираем все сжатые парнеты
+    comp_files = sorted(comp_dir.glob("*.pt"))
+    valid_files = [f for f in comp_files if f.name != "similarities.pt"]
 
-    if not valid_pairs:
-        print("Нет подходящих пар структурированный/сжатый парнет.")
+    if not valid_files:
+        print("Нет подходящих сжатых парнетов.")
         return
 
-    print(f"Найдено {len(valid_pairs)} пар для обработки.")
+    print(f"Найдено {len(valid_files)} сжатых парнетов для обработки.")
     print(f"Энкодер: {encoder_checkpoint_path}")
+    print(f"Параметры шума: range={NOISE_RANGE}, strength={STOCHASTIC_STRENGTH}")
     print(f"Запуск параллельной обработки в {NUM_WORKERS} процессов ({DEVICE})...")
 
     # Подготавливаем задания
     tasks = []
-    for struct_f, comp_f in valid_pairs:
+    for comp_f in valid_files:
         tasks.append((
-            str(struct_f),
             str(comp_f),
             str(output_dir),
             DEVICE,
             ENCODER_CONFIG,
             str(encoder_checkpoint_path),
-            LOG_VAR_VALUE,
+            NOISE_RANGE,
             STOCHASTIC_STRENGTH
         ))
 
